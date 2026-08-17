@@ -15,8 +15,9 @@ pub struct EnumeratedEntry {
     pub entry_index: u64,
     /// The entry's envelope, parsed. The wire bytes this was parsed from are exactly
     /// `JCS(envelope)`, and re-serializing this value under JCS reproduces them, because
-    /// only entries that already passed [`crate::ingest::ingest_entry`]'s canonical-form
-    /// check are ever stored.
+    /// only entries that already passed [`crate::ingest::stage_entry`]'s canonical-form
+    /// check are ever staged, and only proof-verified staged entries are ever promoted to
+    /// canonical storage (see [`crate::ingest::promote_entry`]).
     pub envelope: serde_json::Value,
 }
 

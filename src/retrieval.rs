@@ -25,9 +25,9 @@ pub enum Retrieved {
 /// Retrieve an entry by its AHL entry id.
 ///
 /// Defensively re-checks that the stored bytes still hash to the id they are filed under
-/// before returning them — bytes that fail this check are never served, even though ingest
-/// (see [`crate::ingest::ingest_entry`]) already checked it once, because storage integrity
-/// is a separate concern from ingest-time validation.
+/// before returning them — bytes that fail this check are never served, even though
+/// promotion (see [`crate::ingest::promote_entry`]) already checked it once, because storage
+/// integrity is a separate concern from promotion-time validation.
 ///
 /// # Errors
 ///
@@ -61,7 +61,8 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store");
         let bytes = b"{\"payload\":{},\"signatures\":[]}".to_vec();
         let id = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
-        store.insert_entry(0, &id, &bytes).expect("insert");
+        store.stage_entry(&id, &bytes).expect("stage");
+        store.promote_entry(0, &id).expect("promote");
 
         match retrieve_by_id(&store, &id).expect("no error") {
             Retrieved::Present { entry_index, envelope } => {

@@ -1,11 +1,32 @@
-//! Durable local storage: entry bytes content-addressed by AHL entry id, indexed by entry
-//! position, plus the canonical checkpoint series (adaptor profile §5.2.2, §10).
+//! Durable local storage.
+//!
+//! Staged (unverified) and canonical (proof-admitted) entry bytes, content-addressed by AHL
+//! entry id and indexed by entry position, plus the canonical checkpoint series (adaptor
+//! profile §5.2.2, §10).
+//!
+//! # Staging and canonical admission
+//!
+//! Bytes that merely pass the format checks of [`crate::ingest`] are not yet evidence of
+//! anything the log actually anchored — a party with no authority over the log can submit
+//! any canonical, correctly hashed envelope. Admitting such bytes straight into the
+//! position-indexed table would let that party occupy an index permanently (the index is a
+//! primary key; an occupied index can never be reused), which is a standing denial of
+//! service against the entry the log actually anchored there.
+//!
+//! So there are two tables. `staged_entries` is keyed only by `entry_id` — content-addressed,
+//! not index-exclusive, so any number of candidates may sit there without blocking each
+//! other. `entries` is the canonical, index-keyed table; a row lands there only via
+//! [`Store::promote_entry`], which the caller (see [`crate::ingest::promote_entry`]) may call
+//! only after checking a Merkle inclusion proof of the staged bytes against a checkpoint
+//! already trusted (signature-verified, per [`crate::checkpoint`]). Garbage staged under a
+//! contested index simply never has a valid proof and is never promoted; it costs disk, not
+//! the genuine entry's place in line.
 //!
 //! # Why `SQLite`
 //!
 //! The store needs three things a plain content-addressed directory does not give for free:
 //! (1) an atomic, crash-safe link between "this entry index" and "these exact bytes" so
-//! ingest can never leave a torn write behind; (2) an efficient "smallest `tree_size`
+//! promotion can never leave a torn write behind; (2) an efficient "smallest `tree_size`
 //! strictly greater than `i`" query for `ITUB` (adaptor profile §5.2.1); (3) an efficient
 //! contiguous-range scan for enumeration (§10.3). A single-file `SQLite` database gives all
 //! three with one dependency, no server process, and one file to back up — which is what
@@ -13,10 +34,16 @@
 //! entry id and the entry index exactly as the brief specifies; `SQLite` is the file format,
 //! not an architectural commitment beyond that.
 //!
-//! Concurrency: the store serializes all access behind one connection and one mutex. A
-//! mirror is read-heavy and single-writer by construction (one producer, one log, per
-//! adaptor profile §3), so this is not a throughput compromise for the workload; it is a
-//! correctness simplification the README states plainly.
+//! Concurrency: the store serializes all access behind one connection and one mutex, and
+//! multi-step admission (resolve a governance key, verify a signature, promote several
+//! entries, insert a checkpoint — see [`crate::checkpoint::ingest_checkpoint`]) is a sequence
+//! of individually-safe calls rather than one database transaction. Each step re-checks its
+//! own preconditions at call time, so a concurrent request interleaved between steps can only
+//! ever cause a later step to fail closed (a fresh conflict or an incomplete-range error),
+//! never to admit something unverified. A mirror is single-writer by construction (one
+//! producer, one log, per adaptor profile §3), so this is a documented simplification, not a
+//! silent gap: a deployment with many concurrent writers would want real transactions here
+//! first.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -27,6 +54,10 @@ use crate::checkpoint::Checkpoint;
 use crate::error::{MirrorError, MirrorResult};
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS staged_entries (
+    entry_id TEXT PRIMARY KEY,
+    envelope BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS entries (
     entry_index INTEGER PRIMARY KEY,
     entry_id    TEXT NOT NULL UNIQUE,
@@ -42,13 +73,13 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 ";
 
-/// The outcome of inserting an entry.
+/// The outcome of staging or promoting an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
     /// The entry was newly stored.
     Inserted,
-    /// The exact same entry id and bytes were already stored at this index; ingest is
-    /// idempotent for a repeated, identical submission.
+    /// The exact same entry id (and, where applicable, bytes) was already stored; the
+    /// operation is idempotent for a repeated, identical submission.
     AlreadyPresent,
 }
 
@@ -59,6 +90,15 @@ pub struct StoredEntry {
     pub entry_index: u64,
     /// The exact bytes anchored as this entry (`JCS(envelope)`).
     pub envelope: Vec<u8>,
+}
+
+/// The checkpoint series members immediately below and above some `tree_size`.
+#[derive(Debug, Clone, Default)]
+pub struct Neighbours {
+    /// The nearest series member with a smaller `tree_size`, if any.
+    pub predecessor: Option<Checkpoint>,
+    /// The nearest series member with a larger `tree_size`, if any.
+    pub successor: Option<Checkpoint>,
 }
 
 /// The mirror's durable store.
@@ -116,8 +156,73 @@ impl Store {
         result
     }
 
-    /// The next entry index this store expects (one past the greatest stored index, or 0 for
-    /// an empty store).
+    // -----------------------------------------------------------------------------------
+    // Staging
+    // -----------------------------------------------------------------------------------
+
+    /// Stage `bytes` under `entry_id`, with no claim about position or anchoring.
+    ///
+    /// Idempotent for a repeated, byte-identical submission. Staging never fails on a
+    /// contested position, because staged rows are not index-exclusive — see the module
+    /// docs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MirrorError::EntryIdAtDifferentIndex`]-shaped conflict as
+    /// [`MirrorError::IndexConflict`] only in the practically-unreachable case of the same
+    /// `entry_id` staged with different bytes (which would require a `SHA-256` collision,
+    /// since `entry_id` is a hash of the bytes — checked by the caller before this is
+    /// reached), or [`MirrorError::Store`] on a database failure.
+    pub fn stage_entry(&self, entry_id: &str, bytes: &[u8]) -> MirrorResult<InsertOutcome> {
+        self.with_conn(|conn| {
+            let existing: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT envelope FROM staged_entries WHERE entry_id = ?1",
+                    [entry_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(existing_bytes) = existing {
+                if existing_bytes == bytes {
+                    return Ok(InsertOutcome::AlreadyPresent);
+                }
+                return Err(MirrorError::IndexConflict {
+                    index: 0,
+                    existing_entry_id: entry_id.to_owned(),
+                    new_entry_id: entry_id.to_owned(),
+                });
+            }
+            conn.execute(
+                "INSERT INTO staged_entries (entry_id, envelope) VALUES (?1, ?2)",
+                params![entry_id, bytes],
+            )?;
+            Ok(InsertOutcome::Inserted)
+        })
+    }
+
+    /// Fetch a staged candidate's bytes by entry id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MirrorError::Store`] on a database failure.
+    pub fn get_staged(&self, entry_id: &str) -> MirrorResult<Option<Vec<u8>>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT envelope FROM staged_entries WHERE entry_id = ?1",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(MirrorError::from)
+        })
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Canonical entries
+    // -----------------------------------------------------------------------------------
+
+    /// The next entry index this store expects (one past the greatest canonical index, or 0
+    /// for an empty store).
     ///
     /// # Errors
     ///
@@ -130,24 +235,33 @@ impl Store {
         })
     }
 
-    /// Insert `bytes` at `entry_index` under `entry_id`.
+    /// Promote a staged entry into canonical storage at `entry_index`.
     ///
-    /// Idempotent for a repeated, byte-identical submission at the same index. Rejects a gap
-    /// (`entry_index` is not the next expected index), a conflicting occupant at that index,
-    /// and the same `entry_id` claimed at a second index.
+    /// This performs no proof verification of its own — the caller (see
+    /// [`crate::ingest::promote_entry`]) MUST already have checked a Merkle inclusion proof
+    /// of the staged bytes against a trusted checkpoint before calling this. What this method
+    /// enforces is storage-level integrity: the entry must actually be staged; idempotent for
+    /// a repeated, byte-identical promotion at the same index; rejects a gap (`entry_index` is
+    /// not the next expected canonical index), a conflicting occupant at that index, and the
+    /// same `entry_id` claimed at a second index.
     ///
     /// # Errors
     ///
-    /// [`MirrorError::OutOfOrderIndex`], [`MirrorError::IndexConflict`],
-    /// [`MirrorError::EntryIdAtDifferentIndex`], or [`MirrorError::Store`].
-    pub fn insert_entry(
-        &self,
-        entry_index: u64,
-        entry_id: &str,
-        bytes: &[u8],
-    ) -> MirrorResult<InsertOutcome> {
+    /// [`MirrorError::NotStaged`], [`MirrorError::OutOfOrderIndex`],
+    /// [`MirrorError::IndexConflict`], [`MirrorError::EntryIdAtDifferentIndex`], or
+    /// [`MirrorError::Store`].
+    pub fn promote_entry(&self, entry_index: u64, entry_id: &str) -> MirrorResult<InsertOutcome> {
         let index_i64 = to_i64("entry_index", entry_index)?;
         self.with_conn(|conn| {
+            let bytes: Vec<u8> = conn
+                .query_row(
+                    "SELECT envelope FROM staged_entries WHERE entry_id = ?1",
+                    [entry_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| MirrorError::NotStaged { entry_id: entry_id.to_owned() })?;
+
             let existing_at_index: Option<(String, Vec<u8>)> = conn
                 .query_row(
                     "SELECT entry_id, envelope FROM entries WHERE entry_index = ?1",
@@ -240,28 +354,39 @@ impl Store {
         })
     }
 
+    // -----------------------------------------------------------------------------------
+    // Checkpoints
+    // -----------------------------------------------------------------------------------
+
     /// Insert a checkpoint into the canonical series.
     ///
-    /// This performs no verification of its own — callers MUST validate the checkpoint's
-    /// signature and consistency with the series predecessor (see
-    /// [`crate::checkpoint::verify_checkpoint`] and
-    /// [`crate::checkpoint::verify_series_consistency`]) before calling it. Rejects a
-    /// `tree_size` that is not strictly greater than the series maximum, keeping the series
-    /// append-only and ordered (adaptor profile §5.2.2 item 4).
+    /// This performs no verification of its own — callers (see
+    /// [`crate::checkpoint::ingest_checkpoint`]) MUST validate the checkpoint's signature and
+    /// consistency with its series neighbours first. Series members may be admitted in any
+    /// `tree_size` order, so a gap can be backfilled later — completeness is tracked
+    /// separately (see [`crate::checkpoint::gap_free_frontier`]), not enforced as
+    /// "monotonic" by this table. A `tree_size` already in the series is accepted
+    /// idempotently if the content is byte-identical, and rejected otherwise: adaptor
+    /// profile §5.2.2 item 4 requires the series to be append-only in publication — a
+    /// published member is never withdrawn or replaced.
     ///
     /// # Errors
     ///
-    /// [`MirrorError::NonMonotonicTreeSize`] or [`MirrorError::Store`].
-    pub fn insert_checkpoint(&self, cp: &Checkpoint) -> MirrorResult<()> {
+    /// [`MirrorError::SeriesMemberConflict`] or [`MirrorError::Store`].
+    pub fn insert_checkpoint(&self, cp: &Checkpoint) -> MirrorResult<InsertOutcome> {
         let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
         self.with_conn(|conn| {
-            let max: Option<i64> =
-                conn.query_row("SELECT MAX(tree_size) FROM checkpoints", [], |row| row.get(0))?;
-            if let Some(m) = max {
-                let maximum = to_u64("tree_size", m)?;
-                if cp.tree_size <= maximum {
-                    return Err(MirrorError::NonMonotonicTreeSize { maximum, got: cp.tree_size });
+            let existing = row_to_checkpoint(conn.query_row(
+                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
+                 FROM checkpoints WHERE tree_size = ?1",
+                [tree_size_i64],
+                checkpoint_row,
+            ))?;
+            if let Some(existing) = existing {
+                if &existing == cp {
+                    return Ok(InsertOutcome::AlreadyPresent);
                 }
+                return Err(MirrorError::SeriesMemberConflict { tree_size: cp.tree_size });
             }
             conn.execute(
                 "INSERT INTO checkpoints (tree_size, log_id, root_hash, checkpoint_time, \
@@ -275,7 +400,7 @@ impl Store {
                     cp.signature
                 ],
             )?;
-            Ok(())
+            Ok(InsertOutcome::Inserted)
         })
     }
 
@@ -313,8 +438,36 @@ impl Store {
         })
     }
 
+    /// Fetch the checkpoint series members immediately below and above `tree_size` — the
+    /// predecessor and successor a new member at `tree_size` must be consistency-checked
+    /// against (adaptor profile §5.2.2 item 1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MirrorError::Store`] on a database failure.
+    pub fn neighbours(&self, tree_size: u64) -> MirrorResult<Neighbours> {
+        let tree_size_i64 = to_i64("tree_size", tree_size)?;
+        self.with_conn(|conn| {
+            let predecessor = row_to_checkpoint(conn.query_row(
+                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
+                 FROM checkpoints WHERE tree_size < ?1 ORDER BY tree_size DESC LIMIT 1",
+                [tree_size_i64],
+                checkpoint_row,
+            ))?;
+            let successor = row_to_checkpoint(conn.query_row(
+                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
+                 FROM checkpoints WHERE tree_size > ?1 ORDER BY tree_size ASC LIMIT 1",
+                [tree_size_i64],
+                checkpoint_row,
+            ))?;
+            Ok(Neighbours { predecessor, successor })
+        })
+    }
+
     /// Fetch the checkpoint series member with the smallest `tree_size` strictly greater than
-    /// `index` — the checkpoint `ITUB(index)` reads its time from (adaptor profile §5.2.1).
+    /// `index`. Raw material for `ITUB(index)` (adaptor profile §5.2.1) — see
+    /// [`crate::checkpoint::itub`] for the gap-free-aware version callers MUST use instead of
+    /// this alone.
     ///
     /// # Errors
     ///
@@ -400,7 +553,8 @@ mod tests {
 
         {
             let store = Store::open(&path).expect("open file-backed store");
-            store.insert_entry(0, "sha256:e0", b"a").expect("insert");
+            store.stage_entry("sha256:e0", b"a").expect("stage");
+            store.promote_entry(0, "sha256:e0").expect("promote");
         }
 
         let reopened = Store::open(&path).expect("reopen file-backed store");
@@ -409,15 +563,37 @@ mod tests {
     }
 
     #[test]
+    fn staging_is_not_index_exclusive() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        // Two different candidates may both be staged even though only one can ever be
+        // promoted to a given index — staging never blocks on position.
+        store.stage_entry("sha256:genuine", b"genuine bytes").expect("stage genuine");
+        store.stage_entry("sha256:garbage", b"garbage bytes").expect("stage garbage");
+        assert!(store.get_staged("sha256:genuine").expect("query").is_some());
+        assert!(store.get_staged("sha256:garbage").expect("query").is_some());
+    }
+
+    #[test]
+    fn promotion_requires_a_prior_staged_candidate() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        assert!(matches!(
+            store.promote_entry(0, "sha256:never-staged"),
+            Err(MirrorError::NotStaged { .. })
+        ));
+    }
+
+    #[test]
     fn entries_are_stored_and_fetched_by_id_and_range() {
         let store = Store::open_in_memory().expect("in-memory store");
         assert_eq!(store.next_index().expect("empty store"), 0);
+        store.stage_entry("sha256:e0", b"a").expect("stage");
+        store.stage_entry("sha256:e1", b"b").expect("stage");
         assert_eq!(
-            store.insert_entry(0, "sha256:e0", b"a").expect("first insert"),
+            store.promote_entry(0, "sha256:e0").expect("first promote"),
             InsertOutcome::Inserted
         );
         assert_eq!(
-            store.insert_entry(1, "sha256:e1", b"b").expect("second insert"),
+            store.promote_entry(1, "sha256:e1").expect("second promote"),
             InsertOutcome::Inserted
         );
         assert_eq!(store.next_index().expect("two entries stored"), 2);
@@ -433,11 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn repeated_identical_ingest_is_idempotent() {
+    fn repeated_identical_promotion_is_idempotent() {
         let store = Store::open_in_memory().expect("in-memory store");
-        store.insert_entry(0, "sha256:e0", b"a").expect("first insert");
+        store.stage_entry("sha256:e0", b"a").expect("stage");
+        store.promote_entry(0, "sha256:e0").expect("first promote");
         assert_eq!(
-            store.insert_entry(0, "sha256:e0", b"a").expect("repeat"),
+            store.promote_entry(0, "sha256:e0").expect("repeat"),
             InsertOutcome::AlreadyPresent
         );
     }
@@ -445,9 +622,11 @@ mod tests {
     #[test]
     fn a_conflicting_occupant_is_rejected() {
         let store = Store::open_in_memory().expect("in-memory store");
-        store.insert_entry(0, "sha256:e0", b"a").expect("first insert");
+        store.stage_entry("sha256:e0", b"a").expect("stage first");
+        store.stage_entry("sha256:other", b"different").expect("stage second");
+        store.promote_entry(0, "sha256:e0").expect("first promote");
         assert!(matches!(
-            store.insert_entry(0, "sha256:e0", b"different"),
+            store.promote_entry(0, "sha256:other"),
             Err(MirrorError::IndexConflict { .. })
         ));
     }
@@ -455,8 +634,9 @@ mod tests {
     #[test]
     fn a_gap_is_rejected() {
         let store = Store::open_in_memory().expect("in-memory store");
+        store.stage_entry("sha256:e1", b"b").expect("stage");
         assert!(matches!(
-            store.insert_entry(1, "sha256:e1", b"b"),
+            store.promote_entry(1, "sha256:e1"),
             Err(MirrorError::OutOfOrderIndex { expected: 0, got: 1 })
         ));
     }
@@ -464,18 +644,19 @@ mod tests {
     #[test]
     fn the_same_entry_id_at_a_second_index_is_rejected() {
         let store = Store::open_in_memory().expect("in-memory store");
-        store.insert_entry(0, "sha256:e0", b"a").expect("first insert");
+        store.stage_entry("sha256:e0", b"a").expect("stage");
+        store.promote_entry(0, "sha256:e0").expect("first promote");
         assert!(matches!(
-            store.insert_entry(1, "sha256:e0", b"a"),
+            store.promote_entry(1, "sha256:e0"),
             Err(MirrorError::EntryIdAtDifferentIndex { .. })
         ));
     }
 
     #[test]
-    fn checkpoints_round_trip_and_stay_ordered() {
+    fn checkpoints_round_trip_and_admit_out_of_order() {
         let store = Store::open_in_memory().expect("in-memory store");
-        store.insert_checkpoint(&checkpoint(5)).expect("first checkpoint");
-        store.insert_checkpoint(&checkpoint(10)).expect("second checkpoint");
+        store.insert_checkpoint(&checkpoint(10)).expect("second checkpoint, admitted first");
+        store.insert_checkpoint(&checkpoint(5)).expect("first checkpoint, backfilled");
 
         assert_eq!(store.get_checkpoint(5).expect("query").expect("present").tree_size, 5);
         assert_eq!(store.latest_checkpoint().expect("query").expect("present").tree_size, 10);
@@ -491,19 +672,25 @@ mod tests {
         assert_eq!(store.itub_checkpoint(7).expect("query").expect("present").tree_size, 10);
         assert_eq!(store.itub_checkpoint(3).expect("query").expect("present").tree_size, 5);
         assert!(store.itub_checkpoint(10).expect("query").is_none());
+
+        let Neighbours { predecessor, successor } = store.neighbours(7).expect("query");
+        assert_eq!(predecessor.expect("present").tree_size, 5);
+        assert_eq!(successor.expect("present").tree_size, 10);
     }
 
     #[test]
-    fn a_non_monotonic_tree_size_is_rejected() {
+    fn a_conflicting_series_member_is_rejected() {
         let store = Store::open_in_memory().expect("in-memory store");
         store.insert_checkpoint(&checkpoint(10)).expect("first checkpoint");
+        assert_eq!(
+            store.insert_checkpoint(&checkpoint(10)).expect("identical repeat"),
+            InsertOutcome::AlreadyPresent
+        );
+        let mut different = checkpoint(10);
+        different.root_hash = format!("sha256:{}", "ff".repeat(32));
         assert!(matches!(
-            store.insert_checkpoint(&checkpoint(10)),
-            Err(MirrorError::NonMonotonicTreeSize { maximum: 10, got: 10 })
-        ));
-        assert!(matches!(
-            store.insert_checkpoint(&checkpoint(5)),
-            Err(MirrorError::NonMonotonicTreeSize { maximum: 10, got: 5 })
+            store.insert_checkpoint(&different),
+            Err(MirrorError::SeriesMemberConflict { tree_size: 10 })
         ));
     }
 }

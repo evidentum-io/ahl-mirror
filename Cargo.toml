@@ -1,0 +1,54 @@
+[package]
+name = "ahl-mirror"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Independent AHL log mirror: byte-exact retrieval and authenticated range enumeration for the ahl-adaptor-atl-v1 profile"
+repository = "https://github.com/evidentum-io/ahl-mirror"
+readme = "README.md"
+categories = ["cryptography", "data-structures"]
+keywords = ["provenance", "transparency-log", "merkle-tree", "ahl"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+# See ahl-core Cargo.toml for the rationale: thiserror 1.x (pulled in directly and via the
+# pinned atl-core revision) resolves against both syn 2.x and syn 3.x transitively.
+multiple_crate_versions = "allow"
+
+[dependencies]
+ahl-core = { version = "0.1.0", path = "../ahl-core" }
+atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", version = "0.23.2", default-features = false }
+axum = "0.8.9"
+base64 = "0.22"
+clap = { version = "4.6.6", features = ["derive"] }
+ed25519-dalek = "2"
+hex = "0.4.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["std", "parsing", "formatting", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tower = "0.5.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

@@ -12,14 +12,27 @@
 //! series adaptor profile §5.2.2 requires and the consistency proofs between series members
 //! that its stored material can support.
 //!
+//! An entry becomes retrievable/enumerable only once it carries cryptographic evidence of
+//! anchoring — a Merkle inclusion proof against a checkpoint this mirror has itself
+//! authenticated — never on the strength of a submitted claim alone (see [`ingest`],
+//! [`store`]). Checkpoint-signing keys are resolved the way the profile resolves them: from
+//! the `manifest` entries this mirror already holds canonically, bootstrapped from a
+//! configured genesis anchor (see [`manifest`]), honouring per-key activation bounds. The
+//! checkpoint series tracks whether it is provably gap-free at a declared cadence, and
+//! `ITUB` reports unavailable rather than a guess wherever it is not (see [`checkpoint`]).
+//!
 //! # What this crate is not
 //!
-//! It does not interpret AHL statement payloads, does not walk the statement graph, does
-//! not verify producer signatures, and does not know about the AHL manifest chain. Those are
-//! a verifier's job (core spec §6) and a producer's job respectively. This crate's entire
-//! contract is: bytes in, byte-exact bytes out, with proofs that the log-tree math backs.
-//! See the crate's `README.md` ("Scope and honest gaps") for the specific places the profile
-//! assumes more context than a standalone mirror has, and how this crate resolves that.
+//! It does not walk the statement graph (inputs, outputs, triggers, closure), does not
+//! verify producer signatures, and does not validate manifest-chain linkage
+//! (`predecessor` pointers, signature-based chain-of-trust) — those are a verifier's job
+//! (core spec §6). The one narrow exception is [`manifest`]: it reads the `type` and `log`
+//! fields of `manifest`-typed *canonical* entries, for the sole purpose of resolving
+//! checkpoint-signing keys and cadence the way adaptor profile §7.3 requires, trusting a
+//! manifest entry's content purely because of *where* it sits (core spec §2.3.5), not
+//! because its own signature or lineage was checked. See the crate's `README.md` ("Scope and
+//! honest gaps") for the specific places the profile assumes more context than a standalone
+//! mirror has, and how this crate resolves that.
 //!
 //! # Reuse, not reimplementation
 //!
@@ -58,6 +71,7 @@ pub mod config;
 pub mod error;
 pub mod http;
 pub mod ingest;
+pub mod manifest;
 pub mod metadata;
 pub mod range;
 pub mod retrieval;

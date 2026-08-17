@@ -1,6 +1,7 @@
 //! Checkpoints, the canonical checkpoint series, and `ITUB` (adaptor profile §5.2, §6).
 
 use atl_core::core::merkle::{compute_root, generate_consistency_proof, verify_consistency, Hash};
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use time::macros::format_description;
 use time::{OffsetDateTime, PrimitiveDateTime};
@@ -31,6 +32,21 @@ pub struct Checkpoint {
     pub key_id: String,
     /// `"base64:" || base64(raw 64-byte Ed25519 signature)`.
     pub signature: String,
+}
+
+/// One staged entry to promote atomically alongside checkpoint admission.
+///
+/// Carries a Merkle inclusion proof of its log leaf under the checkpoint being admitted
+/// (adaptor profile §8.2). See [`ingest_checkpoint`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPromotion {
+    /// The staged entry's id.
+    pub entry_id: String,
+    /// Its claimed position — becomes its canonical `entry_index` if the proof verifies.
+    pub leaf_index: u64,
+    /// The inclusion proof path, leaf to root, as `sha256:<hex>` strings (adaptor profile
+    /// §8.2).
+    pub inclusion_path: Vec<String>,
 }
 
 const CHECKPOINT_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
@@ -92,24 +108,28 @@ pub fn checkpoint_blob(cp: &Checkpoint) -> MirrorResult<[u8; CHECKPOINT_BLOB_LEN
     Ok(blob)
 }
 
-/// Verify `cp`'s identity and signature against this mirror's configured trust (adaptor
-/// profile §6.5, steps 1-5, restricted to the single configured `log_id`).
+/// Verify `cp`'s identity and signature against a specific, already-resolved key (adaptor
+/// profile §6.5, steps 1-5).
+///
+/// This function performs no key *resolution* — see [`crate::manifest::resolve`] for that —
+/// and no series-level checks (ordering, consistency, completeness); see
+/// [`ingest_checkpoint`] for the full admission pipeline.
 ///
 /// If `raw` is given, it is checked byte for byte against the assembled blob first (§6.4).
-///
-/// This function checks signature validity only — it does not check series ordering or
-/// consistency with a predecessor; see [`verify_series_consistency`] and
-/// [`crate::store::Store::insert_checkpoint`] for that.
 ///
 /// # Errors
 ///
 /// [`MirrorError::WrongLogId`], [`MirrorError::RawBlobMismatch`],
-/// [`MirrorError::UnknownSigningKey`], [`MirrorError::SignatureInvalid`], or a parsing
-/// error from [`checkpoint_blob`].
-pub fn verify_checkpoint(cp: &Checkpoint, raw: Option<&[u8]>, config: &Config) -> MirrorResult<()> {
-    if cp.log_id != config.log_id {
+/// [`MirrorError::SignatureInvalid`], or a parsing error from [`checkpoint_blob`].
+pub fn verify_checkpoint_signature(
+    cp: &Checkpoint,
+    raw: Option<&[u8]>,
+    log_id: &str,
+    key: &VerifyingKey,
+) -> MirrorResult<()> {
+    if cp.log_id != log_id {
         return Err(MirrorError::WrongLogId {
-            expected: config.log_id.clone(),
+            expected: log_id.to_owned(),
             got: cp.log_id.clone(),
         });
     }
@@ -119,10 +139,7 @@ pub fn verify_checkpoint(cp: &Checkpoint, raw: Option<&[u8]>, config: &Config) -
             return Err(MirrorError::RawBlobMismatch);
         }
     }
-    let key = config
-        .key(&cp.key_id)
-        .ok_or_else(|| MirrorError::UnknownSigningKey { key_id: cp.key_id.clone() })?;
-    if !ahl_core::verify_signature(&key.verifying_key, &blob, &cp.signature)? {
+    if !ahl_core::verify_signature(key, &blob, &cp.signature)? {
         return Err(MirrorError::SignatureInvalid { key_id: cp.key_id.clone() });
     }
     Ok(())
@@ -132,7 +149,9 @@ pub fn verify_checkpoint(cp: &Checkpoint, raw: Option<&[u8]>, config: &Config) -
 ///
 /// That is: `from_cp` is exactly the size-`from_cp.tree_size` prefix of the tree `to_cp`
 /// commits, given the leaf hashes covering `[0, to_cp.tree_size)` (adaptor profile §5.2.2
-/// item 1; core spec §3 contract item 3).
+/// item 1; core spec §3 contract item 3). `from_cp.tree_size` MUST be less than
+/// `to_cp.tree_size` — this checks extension in one direction only; callers with two
+/// checkpoints in unknown order MUST establish which is smaller first.
 ///
 /// # Errors
 ///
@@ -155,64 +174,168 @@ pub fn verify_series_consistency(
     Ok(verify_consistency(&proof, &from_root, &to_root)?)
 }
 
+/// Fetch the complete, contiguous log-leaf-hash sequence for `[0, tree_size)`, or report how
+/// far short the store is.
+fn leaf_hashes_for(store: &Store, tree_size: u64) -> MirrorResult<Vec<Hash>> {
+    let entries = store.get_entries_range(0, tree_size)?;
+    let have = u64::try_from(entries.len())
+        .map_err(|_| MirrorError::IndexOverflow { what: "entries.len()" })?;
+    if have != tree_size {
+        return Err(MirrorError::IncompleteEntries { have, need: tree_size });
+    }
+    Ok(entries.iter().map(|bytes| log_leaf_hash(bytes)).collect())
+}
+
 /// Verify and admit `cp` into the canonical checkpoint series (adaptor profile §5.2.2).
 ///
-/// Requires, in order: a valid signature under the configured `log_id` (see
-/// [`verify_checkpoint`]); complete, contiguous entries for `[0, cp.tree_size)` in `store`;
-/// those entries to recompute to `cp.root_hash`; and — if the series already has a member —
-/// a verified consistency proof from the latest existing member to `cp` (see
-/// [`verify_series_consistency`]), which is what keeps the series gap-free in publication
-/// (adaptor profile §5.2.2 item 1). Only after every check passes is `cp` inserted.
+/// The pipeline, in order:
+///
+/// 1. Resolve the checkpoint-signing key via [`crate::manifest::resolve`], using **only**
+///    entries already canonical before this call — never `entries_to_promote`, which are not
+///    yet trusted at this point. A checkpoint can therefore never validate itself by way of
+///    governance material it is simultaneously trying to introduce.
+/// 2. Verify the signature against that key (adaptor profile §6.5). Only once this passes is
+///    `cp.root_hash` treated as authenticated — a checkpoint's admission to the series rests
+///    on this alone, not on entry availability (see below).
+/// 3. Promote every entry in `entries_to_promote`, each checked by Merkle inclusion proof
+///    against the now-authenticated root (adaptor profile §8.2) — the "or admitted in the
+///    same operation" half of retrieval/enumeration's evidence requirement.
+/// 4. **Opportunistically**, if `[0, cp.tree_size)` happens to be complete after step 3 (via
+///    `entries_to_promote` just now, or already, via earlier standalone
+///    [`crate::ingest::promote_entry`] calls against a checkpoint admitted previously): check
+///    it recomputes to `cp.root_hash`, and check consistency against **both** series
+///    neighbours that already exist — predecessor and successor by `tree_size`, so a
+///    checkpoint backfilled between two admitted members is checked against both sides
+///    (adaptor profile §5.2.2 item 1). If the range is *not* yet complete, these checks are
+///    skipped rather than blocking admission — checkpoints and entry bytes routinely arrive
+///    on different schedules (adaptor profile §10.1 discusses exactly this split), and
+///    entry-level correctness is never weakened by skipping them here: no entry is ever
+///    promoted without its own inclusion proof verifying, regardless of whether this
+///    opportunistic check ran.
+/// 5. Insert `cp` into the series (any `tree_size` order is accepted; see
+///    [`crate::store::Store::insert_checkpoint`]).
 ///
 /// # Errors
 ///
-/// [`MirrorError::IncompleteEntries`] if the mirror has not yet caught up to `cp.tree_size`;
-/// [`MirrorError::CheckpointRootMismatch`] if the stored entries do not open `cp.root_hash`;
-/// [`MirrorError::InconsistentWithPredecessor`] if `cp` is not a valid extension of the
-/// series; or a signature/store error from the checks above.
+/// Any [`MirrorError`] from the steps above. Governance material this mirror has not yet
+/// seen never causes a distinct "unresolvable" error — resolution against a stale key set
+/// fails naturally via [`MirrorError::UnknownSigningKey`]; see the `manifest` module for why
+/// that is safe. [`MirrorError::KeyNotYetActive`], [`MirrorError::InclusionProofInvalid`],
+/// [`MirrorError::CheckpointRootMismatch`] and [`MirrorError::InconsistentWithNeighbour`] are
+/// all live outcomes.
 pub fn ingest_checkpoint(
     store: &Store,
     config: &Config,
     cp: &Checkpoint,
     raw: Option<&[u8]>,
+    entries_to_promote: &[PendingPromotion],
 ) -> MirrorResult<()> {
-    verify_checkpoint(cp, raw, config)?;
+    let snapshot = crate::manifest::resolve(store, config, cp.tree_size)?;
+    let key = snapshot.resolve_key(&cp.key_id, cp.tree_size)?;
+    verify_checkpoint_signature(cp, raw, &config.log_id, key)?;
 
-    let all_entries = store.get_entries_range(0, cp.tree_size)?;
-    let have = u64::try_from(all_entries.len())
-        .map_err(|_| MirrorError::IndexOverflow { what: "all_entries.len()" })?;
-    if have != cp.tree_size {
-        return Err(MirrorError::IncompleteEntries { have, need: cp.tree_size });
+    for pending in entries_to_promote {
+        crate::ingest::promote_entry(
+            store,
+            cp,
+            &pending.entry_id,
+            pending.leaf_index,
+            &pending.inclusion_path,
+        )?;
     }
 
-    let leaf_hashes: Vec<Hash> = all_entries.iter().map(|bytes| log_leaf_hash(bytes)).collect();
-    let root: Hash = ahl_core::parse_hash_hex(&cp.root_hash)?;
-    if compute_root(&leaf_hashes) != root {
-        return Err(MirrorError::CheckpointRootMismatch { tree_size: cp.tree_size });
-    }
+    if let Ok(leaf_hashes) = leaf_hashes_for(store, cp.tree_size) {
+        let root: Hash = ahl_core::parse_hash_hex(&cp.root_hash)?;
+        if compute_root(&leaf_hashes) != root {
+            return Err(MirrorError::CheckpointRootMismatch { tree_size: cp.tree_size });
+        }
 
-    if let Some(predecessor) = store.latest_checkpoint()? {
-        if !verify_series_consistency(&predecessor, cp, &leaf_hashes)? {
-            return Err(MirrorError::InconsistentWithPredecessor {
-                predecessor_tree_size: predecessor.tree_size,
-                tree_size: cp.tree_size,
-            });
+        let crate::store::Neighbours { predecessor, successor } = store.neighbours(cp.tree_size)?;
+        if let Some(predecessor) = predecessor {
+            if !verify_series_consistency(&predecessor, cp, &leaf_hashes)? {
+                return Err(MirrorError::InconsistentWithNeighbour {
+                    neighbour_tree_size: predecessor.tree_size,
+                    tree_size: cp.tree_size,
+                });
+            }
+        }
+        if let Some(successor) = successor {
+            if let Ok(successor_leaves) = leaf_hashes_for(store, successor.tree_size) {
+                if !verify_series_consistency(cp, &successor, &successor_leaves)? {
+                    return Err(MirrorError::InconsistentWithNeighbour {
+                        neighbour_tree_size: successor.tree_size,
+                        tree_size: cp.tree_size,
+                    });
+                }
+            }
         }
     }
 
-    store.insert_checkpoint(cp)
+    store.insert_checkpoint(cp)?;
+    Ok(())
 }
 
-/// `ITUB(index)`: the `checkpoint_time` of the smallest-`tree_size` series member with
-/// `tree_size > index` (adaptor profile §5.2.1). `series` MUST already be ascending by
-/// `tree_size`.
+/// The `tree_size` up to and including which `series` is proven gap-free.
 ///
-/// Returns `None` if the series does not yet contain a member covering `index` — `ITUB` is
-/// then undefined under the profile, and callers MUST report incorporation time as
-/// unavailable rather than substitute a value.
-#[must_use]
-pub fn itub(series: &[Checkpoint], index: u64) -> Option<&Checkpoint> {
-    series.iter().find(|cp| cp.tree_size > index)
+/// "Gap-free" at `cadence_seconds` (adaptor profile §5.2.2) means: every adjacent pair of
+/// members, by `tree_size`, is no further apart in `checkpoint_time` than the declared
+/// cadence. `series` MUST already be ascending by `tree_size`.
+///
+/// Returns `None` if `cadence_seconds` is `None` (cadence itself undeclared) or `series` is
+/// empty — in either case nothing can be proven gap-free.
+///
+/// # Errors
+///
+/// Propagates a [`MirrorError::BadCheckpointTime`] if any member's `checkpoint_time` is
+/// malformed (should not occur for admitted members, which are checked at admission time).
+pub fn gap_free_frontier(
+    series: &[Checkpoint],
+    cadence_seconds: Option<u64>,
+) -> MirrorResult<Option<u64>> {
+    let Some(cadence_seconds) = cadence_seconds else { return Ok(None) };
+    let Some(first) = series.first() else { return Ok(None) };
+
+    let cadence_nanos = cadence_seconds.saturating_mul(1_000_000_000);
+    let mut frontier = first.tree_size;
+    let mut previous_nanos = parse_checkpoint_time(&first.checkpoint_time)?;
+
+    for cp in &series[1..] {
+        let nanos = parse_checkpoint_time(&cp.checkpoint_time)?;
+        if nanos.saturating_sub(previous_nanos) > cadence_nanos {
+            break;
+        }
+        frontier = cp.tree_size;
+        previous_nanos = nanos;
+    }
+
+    Ok(Some(frontier))
+}
+
+/// `ITUB(index)`: the checkpoint carrying the time the profile allows treating as `index`'s
+/// incorporation-time upper bound.
+///
+/// That checkpoint is the smallest-`tree_size` series member with `tree_size > index`
+/// (adaptor profile §5.2.1) — but returned **only** if the series is proven gap-free, per
+/// [`gap_free_frontier`], up to and including that member. `series` MUST already be
+/// ascending by `tree_size`.
+///
+/// Returns `None` — unavailable, never a computed value — if no covering member exists, or
+/// if the series is not proven gap-free that far. Adaptor profile §5.2.2 states `ITUB` is
+/// undefined without a canonical (complete) checkpoint series, and pairwise consistency
+/// between the members this mirror happens to hold does not establish completeness: it
+/// proves each pair is a valid extension of the other, never that nothing was omitted
+/// between them.
+///
+/// # Errors
+///
+/// Propagates a [`MirrorError`] from [`gap_free_frontier`].
+pub fn itub(
+    series: &[Checkpoint],
+    index: u64,
+    cadence_seconds: Option<u64>,
+) -> MirrorResult<Option<&Checkpoint>> {
+    let Some(frontier) = gap_free_frontier(series, cadence_seconds)? else { return Ok(None) };
+    Ok(series.iter().find(|cp| cp.tree_size > index && cp.tree_size <= frontier))
 }
 
 #[cfg(test)]
@@ -220,7 +343,7 @@ mod tests {
     use sha2::Digest as _;
 
     use super::*;
-    use crate::config::{Config, ConfigSpec, TrustedLogKeySpec};
+    use crate::config::{ConfigSpec, TrustedLogKeySpec};
 
     fn signed_checkpoint(
         key: &ahl_core::TestKey,
@@ -289,6 +412,8 @@ mod tests {
                 pubkey: key.pubkey(),
                 valid_from_index: 0,
             }],
+            genesis_manifest_entry_id: None,
+            genesis_checkpoint_cadence_seconds: Some(300),
             store_path: ":memory:".to_owned(),
         })
         .expect("valid config")
@@ -305,8 +430,8 @@ mod tests {
             &format!("sha256:{}", "66".repeat(32)),
             "2026-01-01T00:00:00.000000000Z",
         );
-        let config = config_with(&key, &log_id);
-        verify_checkpoint(&cp, None, &config).expect("valid signature and log_id");
+        verify_checkpoint_signature(&cp, None, &log_id, &key.verifying_key())
+            .expect("valid signature and log_id");
     }
 
     #[test]
@@ -319,29 +444,10 @@ mod tests {
             &format!("sha256:{}", "bb".repeat(32)),
             "2026-01-01T00:00:00.000000000Z",
         );
-        let config = config_with(&key, &format!("sha256:{}", "cc".repeat(32)));
+        let other_log_id = format!("sha256:{}", "cc".repeat(32));
         assert!(matches!(
-            verify_checkpoint(&cp, None, &config),
+            verify_checkpoint_signature(&cp, None, &other_log_id, &key.verifying_key()),
             Err(MirrorError::WrongLogId { .. })
-        ));
-    }
-
-    #[test]
-    fn an_untrusted_signing_key_is_rejected() {
-        let key = ahl_core::TestKey::from_seed_hex("log-1", &"06".repeat(32)).expect("seed");
-        let other = ahl_core::TestKey::from_seed_hex("other", &"07".repeat(32)).expect("seed");
-        let log_id = format!("sha256:{}", "dd".repeat(32));
-        let cp = signed_checkpoint(
-            &key,
-            &log_id,
-            10,
-            &format!("sha256:{}", "ee".repeat(32)),
-            "2026-01-01T00:00:00.000000000Z",
-        );
-        let config = config_with(&other, &log_id);
-        assert!(matches!(
-            verify_checkpoint(&cp, None, &config),
-            Err(MirrorError::UnknownSigningKey { .. })
         ));
     }
 
@@ -357,9 +463,8 @@ mod tests {
             "2026-01-01T00:00:00.000000000Z",
         );
         cp.tree_size = 11; // mutate a signed field without re-signing
-        let config = config_with(&key, &log_id);
         assert!(matches!(
-            verify_checkpoint(&cp, None, &config),
+            verify_checkpoint_signature(&cp, None, &log_id, &key.verifying_key()),
             Err(MirrorError::SignatureInvalid { .. })
         ));
     }
@@ -375,16 +480,49 @@ mod tests {
             &format!("sha256:{}", "13".repeat(32)),
             "2026-01-01T00:00:00.000000000Z",
         );
-        let config = config_with(&key, &log_id);
         let bad_raw = [0u8; CHECKPOINT_BLOB_LEN];
         assert!(matches!(
-            verify_checkpoint(&cp, Some(&bad_raw), &config),
+            verify_checkpoint_signature(&cp, Some(&bad_raw), &log_id, &key.verifying_key()),
             Err(MirrorError::RawBlobMismatch)
         ));
     }
 
     #[test]
-    fn itub_picks_the_smallest_covering_checkpoint() {
+    fn a_checkpoint_signed_by_a_key_below_its_activation_bound_is_rejected() {
+        // The "checkpoint signed by a key outside its validity range" required negative
+        // test, exercised at the genesis-key path: the key exists and the signature is
+        // mathematically valid, but it is not yet active for this tree_size.
+        let key = ahl_core::TestKey::from_seed_hex("log-1", &"0d".repeat(32)).expect("seed");
+        let log_id = format!("sha256:{}", "17".repeat(32));
+        let config = Config::resolve(&ConfigSpec {
+            log_id: log_id.clone(),
+            keys: vec![TrustedLogKeySpec {
+                key_id: key.key_id(),
+                pubkey: key.pubkey(),
+                valid_from_index: 100,
+            }],
+            genesis_manifest_entry_id: None,
+            genesis_checkpoint_cadence_seconds: None,
+            store_path: ":memory:".to_owned(),
+        })
+        .expect("valid config");
+        let store = Store::open_in_memory().expect("in-memory store");
+        let cp = signed_checkpoint(
+            &key,
+            &log_id,
+            10,
+            &format!("sha256:{}", "18".repeat(32)),
+            "2026-01-01T00:00:00.000000000Z",
+        );
+        assert!(matches!(
+            ingest_checkpoint(&store, &config, &cp, None, &[]),
+            Err(MirrorError::KeyNotYetActive { valid_from_index: 100, tree_size: 10, .. })
+        ));
+        assert!(store.latest_checkpoint().expect("query").is_none());
+    }
+
+    #[test]
+    fn itub_picks_the_smallest_covering_checkpoint_when_the_series_is_gap_free() {
         let series = vec![
             Checkpoint {
                 log_id: "sha256:aa".to_owned(),
@@ -398,15 +536,62 @@ mod tests {
                 log_id: "sha256:aa".to_owned(),
                 tree_size: 10,
                 root_hash: "sha256:bb".to_owned(),
-                checkpoint_time: "2026-01-02T00:00:00.000000000Z".to_owned(),
+                checkpoint_time: "2026-01-01T00:04:00.000000000Z".to_owned(),
                 key_id: "sha256:aa".to_owned(),
                 signature: "base64:AAAA".to_owned(),
             },
         ];
-        assert_eq!(itub(&series, 3).expect("covered").tree_size, 5);
-        assert_eq!(itub(&series, 5).expect("covered").tree_size, 10);
-        assert_eq!(itub(&series, 9).expect("covered").tree_size, 10);
-        assert!(itub(&series, 10).is_none());
+        let cadence = Some(300); // 5 minutes; the two members are 4 minutes apart.
+        assert_eq!(itub(&series, 3, cadence).expect("well-formed").expect("covered").tree_size, 5);
+        assert_eq!(itub(&series, 5, cadence).expect("well-formed").expect("covered").tree_size, 10);
+        assert_eq!(itub(&series, 9, cadence).expect("well-formed").expect("covered").tree_size, 10);
+        assert!(itub(&series, 10, cadence).expect("well-formed").is_none());
+    }
+
+    #[test]
+    fn itub_is_unavailable_across_an_undetected_time_gap() {
+        // Two checkpoints that are individually perfectly well-formed, and mutually
+        // consistent (each is a real prefix of the other's tree) — but the second arrives
+        // far later than the declared cadence allows, meaning checkpoints the cadence
+        // implies should exist in between were never shown to this mirror. Pairwise
+        // consistency cannot detect that; only the cadence check can.
+        let series = vec![
+            Checkpoint {
+                log_id: "sha256:aa".to_owned(),
+                tree_size: 4,
+                root_hash: "sha256:aa".to_owned(),
+                checkpoint_time: "2026-01-01T00:00:00.000000000Z".to_owned(),
+                key_id: "sha256:aa".to_owned(),
+                signature: "base64:AAAA".to_owned(),
+            },
+            Checkpoint {
+                log_id: "sha256:aa".to_owned(),
+                tree_size: 9,
+                root_hash: "sha256:bb".to_owned(),
+                checkpoint_time: "2026-01-01T03:00:00.000000000Z".to_owned(), // 3 hours later
+                key_id: "sha256:aa".to_owned(),
+                signature: "base64:AAAA".to_owned(),
+            },
+        ];
+        let cadence = Some(300); // 5 minutes — the 3-hour jump is a gap.
+        assert_eq!(gap_free_frontier(&series, cadence).expect("well-formed"), Some(4));
+        assert_eq!(itub(&series, 5, cadence).expect("well-formed"), None);
+        assert_eq!(itub(&series, 3, cadence).expect("well-formed").expect("covered").tree_size, 4);
+    }
+
+    #[test]
+    fn itub_is_unavailable_without_a_known_cadence() {
+        let series = vec![Checkpoint {
+            log_id: "sha256:aa".to_owned(),
+            tree_size: 5,
+            root_hash: "sha256:aa".to_owned(),
+            checkpoint_time: "2026-01-01T00:00:00.000000000Z".to_owned(),
+            key_id: "sha256:aa".to_owned(),
+            signature: "base64:AAAA".to_owned(),
+        }];
+        assert_eq!(itub(&series, 0, None).expect("well-formed"), None);
+        assert_eq!(gap_free_frontier(&series, None).expect("well-formed"), None);
+        assert_eq!(gap_free_frontier(&[], Some(300)).expect("well-formed"), None);
     }
 
     #[test]
@@ -454,41 +639,69 @@ mod tests {
         )
     }
 
+    fn stage_and_promote_from(store: &Store, start_index: u64, entries: &[Vec<u8>]) {
+        for (offset, bytes) in entries.iter().enumerate() {
+            let id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+            store.stage_entry(&id, bytes).expect("stage");
+            let index = start_index + u64::try_from(offset).expect("small test size");
+            store.promote_entry(index, &id).expect("promote");
+        }
+    }
+
+    fn stage_and_promote_all(store: &Store, entries: &[Vec<u8>]) {
+        stage_and_promote_from(store, 0, entries);
+    }
+
     #[test]
-    fn a_checkpoint_over_fully_stored_entries_is_admitted() {
+    fn a_checkpoint_over_fully_canonical_entries_is_admitted() {
         let key = ahl_core::TestKey::from_seed_hex("log-1", &"0a".repeat(32)).expect("seed");
         let log_id = format!("sha256:{}", "14".repeat(32));
         let store = Store::open_in_memory().expect("in-memory store");
         let entries: Vec<Vec<u8>> = (0u8..4).map(stored_entry).collect();
-        for (i, bytes) in entries.iter().enumerate() {
-            let id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
-            store.insert_entry(i as u64, &id, bytes).expect("insert");
-        }
+        stage_and_promote_all(&store, &entries);
         let cp = checkpoint_for(&key, &log_id, &entries);
         let config = config_with(&key, &log_id);
-        ingest_checkpoint(&store, &config, &cp, None).expect("complete, well-formed checkpoint");
+        ingest_checkpoint(&store, &config, &cp, None, &[])
+            .expect("complete, well-formed checkpoint");
         assert_eq!(store.latest_checkpoint().expect("query").expect("present").tree_size, 4);
     }
 
     #[test]
-    fn a_checkpoint_ahead_of_stored_entries_leaves_a_gap_and_is_rejected() {
-        // The checkpoint commits 8 entries but the mirror has only received 4 — exactly the
-        // "gap in the checkpoint series" the task brief asks to be tested: the series must
-        // never advertise a member the store cannot yet back with complete entries.
+    fn a_checkpoint_can_be_admitted_ahead_of_its_own_entries() {
+        // A checkpoint's admission to the series rests on its signature, not on this mirror
+        // already holding every entry it commits — checkpoints and entry bytes routinely
+        // arrive on different schedules (adaptor profile §10.1). Nothing about the entries
+        // is trusted here; only the checkpoint's authenticated root enters the series.
         let key = ahl_core::TestKey::from_seed_hex("log-1", &"0b".repeat(32)).expect("seed");
         let log_id = format!("sha256:{}", "15".repeat(32));
         let store = Store::open_in_memory().expect("in-memory store");
-        let received: Vec<Vec<u8>> = (0u8..4).map(stored_entry).collect();
-        for (i, bytes) in received.iter().enumerate() {
-            let id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
-            store.insert_entry(i as u64, &id, bytes).expect("insert");
-        }
         let all_eight: Vec<Vec<u8>> = (0u8..8).map(stored_entry).collect();
         let cp = checkpoint_for(&key, &log_id, &all_eight);
         let config = config_with(&key, &log_id);
+        ingest_checkpoint(&store, &config, &cp, None, &[])
+            .expect("valid signature admits the checkpoint regardless of entry lag");
+        assert_eq!(store.latest_checkpoint().expect("query").expect("present").tree_size, 8);
+        // The entries themselves remain unavailable until proof-verified promotion.
+        assert_eq!(store.next_index().expect("query"), 0);
+    }
+
+    #[test]
+    fn a_checkpoint_whose_available_entries_disagree_with_its_root_is_rejected() {
+        // The opportunistic self-check: when the full entry range genuinely is already
+        // canonical, an admitted checkpoint's claimed root MUST still recompute from it —
+        // catching a validly-signed checkpoint over the wrong root the moment the data to
+        // check it against exists.
+        let key = ahl_core::TestKey::from_seed_hex("log-1", &"1b".repeat(32)).expect("seed");
+        let log_id = format!("sha256:{}", "1c".repeat(32));
+        let store = Store::open_in_memory().expect("in-memory store");
+        let entries: Vec<Vec<u8>> = (0u8..4).map(stored_entry).collect();
+        stage_and_promote_all(&store, &entries);
+        let wrong_root_entries: Vec<Vec<u8>> = (10u8..14).map(stored_entry).collect();
+        let cp = checkpoint_for(&key, &log_id, &wrong_root_entries); // same count, different root
+        let config = config_with(&key, &log_id);
         assert!(matches!(
-            ingest_checkpoint(&store, &config, &cp, None),
-            Err(MirrorError::IncompleteEntries { have: 4, need: 8 })
+            ingest_checkpoint(&store, &config, &cp, None, &[]),
+            Err(MirrorError::CheckpointRootMismatch { tree_size: 4 })
         ));
         assert!(store.latest_checkpoint().expect("query").is_none());
     }
@@ -499,24 +712,75 @@ mod tests {
         let log_id = format!("sha256:{}", "16".repeat(32));
         let store = Store::open_in_memory().expect("in-memory store");
         let first: Vec<Vec<u8>> = (0u8..4).map(stored_entry).collect();
-        for (i, bytes) in first.iter().enumerate() {
-            let id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
-            store.insert_entry(i as u64, &id, bytes).expect("insert");
-        }
+        stage_and_promote_all(&store, &first);
         let config = config_with(&key, &log_id);
         let cp1 = checkpoint_for(&key, &log_id, &first);
-        ingest_checkpoint(&store, &config, &cp1, None).expect("first checkpoint");
+        ingest_checkpoint(&store, &config, &cp1, None, &[]).expect("first checkpoint");
 
-        let more: Vec<Vec<u8>> = (4u8..9).map(stored_entry).collect();
-        for (offset, bytes) in more.iter().enumerate() {
-            let index = 4 + offset as u64;
-            let id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
-            store.insert_entry(index, &id, bytes).expect("insert");
-        }
         let all_nine: Vec<Vec<u8>> = (0u8..9).map(stored_entry).collect();
+        stage_and_promote_from(&store, 4, &all_nine[4..]);
         let cp2 = checkpoint_for(&key, &log_id, &all_nine);
-        ingest_checkpoint(&store, &config, &cp2, None)
+        ingest_checkpoint(&store, &config, &cp2, None, &[])
             .expect("second checkpoint extends the series");
+
+        let series = store.checkpoint_series().expect("series");
+        assert_eq!(series.iter().map(|c| c.tree_size).collect::<Vec<_>>(), vec![4, 9]);
+    }
+
+    #[test]
+    fn entries_to_promote_admits_a_checkpoint_and_its_entries_in_one_call() {
+        let key = ahl_core::TestKey::from_seed_hex("log-1", &"0e".repeat(32)).expect("seed");
+        let log_id = format!("sha256:{}", "19".repeat(32));
+        let store = Store::open_in_memory().expect("in-memory store");
+        let entries: Vec<Vec<u8>> = (0u8..4).map(stored_entry).collect();
+        let leaves: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+
+        let tree_size = u64::try_from(leaves.len()).expect("small test size");
+        let mut pending = Vec::new();
+        for (i, bytes) in entries.iter().enumerate() {
+            let id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+            store.stage_entry(&id, bytes).expect("stage");
+            let index = u64::try_from(i).expect("small test size");
+            let proof =
+                atl_core::core::merkle::generate_inclusion_proof(index, tree_size, |level, at| {
+                    if level == 0 {
+                        leaves.get(usize::try_from(at).ok()?).copied()
+                    } else {
+                        None
+                    }
+                })
+                .expect("index within tree");
+            pending.push(PendingPromotion {
+                entry_id: id,
+                leaf_index: index,
+                inclusion_path: ahl_core::proof_path_hex(&proof),
+            });
+        }
+
+        let cp = checkpoint_for(&key, &log_id, &entries);
+        let config = config_with(&key, &log_id);
+        ingest_checkpoint(&store, &config, &cp, None, &pending)
+            .expect("checkpoint and its entries admitted together");
+        assert_eq!(store.next_index().expect("query"), 4);
+        assert_eq!(store.latest_checkpoint().expect("query").expect("present").tree_size, 4);
+    }
+
+    #[test]
+    fn a_backfilled_checkpoint_is_checked_against_both_neighbours() {
+        let key = ahl_core::TestKey::from_seed_hex("log-1", &"0f".repeat(32)).expect("seed");
+        let log_id = format!("sha256:{}", "1a".repeat(32));
+        let store = Store::open_in_memory().expect("in-memory store");
+        let config = config_with(&key, &log_id);
+
+        let all_nine: Vec<Vec<u8>> = (0u8..9).map(stored_entry).collect();
+        stage_and_promote_all(&store, &all_nine);
+
+        let cp4 = checkpoint_for(&key, &log_id, &all_nine[..4]);
+        let cp9 = checkpoint_for(&key, &log_id, &all_nine);
+        // Admit the larger one first, then backfill the smaller — exercises the successor
+        // side of the neighbour check, not just the predecessor side.
+        ingest_checkpoint(&store, &config, &cp9, None, &[]).expect("larger checkpoint first");
+        ingest_checkpoint(&store, &config, &cp4, None, &[]).expect("backfilled checkpoint");
 
         let series = store.checkpoint_series().expect("series");
         assert_eq!(series.iter().map(|c| c.tree_size).collect::<Vec<_>>(), vec![4, 9]);

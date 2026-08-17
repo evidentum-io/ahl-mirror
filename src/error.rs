@@ -79,6 +79,28 @@ pub enum MirrorError {
         requested_index: u64,
     },
 
+    // ---- staging and promotion (fix for admission without evidence of anchoring) ----
+    /// No staged candidate with this entry id exists; it must be staged before it can be
+    /// promoted.
+    #[error("no staged entry `{entry_id}`; stage it before promoting it")]
+    NotStaged {
+        /// The entry id that was not found in staging.
+        entry_id: String,
+    },
+
+    /// The inclusion proof offered for a staged entry does not verify against the named
+    /// checkpoint's root. Unverified bytes are never admitted to canonical storage on the
+    /// strength of a claim alone (adaptor profile §8.2; core spec §3 contract item 3).
+    #[error("inclusion proof for `{entry_id}` at index {leaf_index} does not verify under tree_size {tree_size}")]
+    InclusionProofInvalid {
+        /// The entry id whose inclusion was claimed.
+        entry_id: String,
+        /// The claimed entry index.
+        leaf_index: u64,
+        /// The checkpoint's tree size the proof was checked against.
+        tree_size: u64,
+    },
+
     // ---- retrieval (adaptor profile §10.1.1) ----
     /// Bytes on disk no longer hash to the entry id they are filed under. A storage
     /// integrity fault; never served to a caller as if it were the entry.
@@ -143,11 +165,37 @@ pub enum MirrorError {
         got: String,
     },
 
-    /// A checkpoint is signed by a key this mirror does not trust.
+    /// A checkpoint is signed by a key this mirror does not trust — not present in the
+    /// active governance snapshot (genesis configuration, or the manifest version active
+    /// for the checkpoint's `tree_size`; adaptor profile §7.3).
     #[error("checkpoint signed by untrusted key `{key_id}`")]
     UnknownSigningKey {
         /// The untrusted `key_id`.
         key_id: String,
+    },
+
+    /// The resolved key exists but is not yet active at this checkpoint's `tree_size`
+    /// (adaptor profile §7.3 activation bound: `valid_from_index`).
+    #[error("key `{key_id}` is not valid until index {valid_from_index}, checkpoint tree_size is {tree_size}")]
+    KeyNotYetActive {
+        /// The key in question.
+        key_id: String,
+        /// The index the key becomes valid at.
+        valid_from_index: u64,
+        /// The checkpoint's `tree_size`.
+        tree_size: u64,
+    },
+
+    /// The first `manifest`-typed canonical entry found does not match the configured
+    /// genesis anchor (core spec §2.3.5; receipt format's local-policy rule).
+    #[error(
+        "first manifest entry `{found}` does not match the configured genesis anchor `{expected}`"
+    )]
+    GenesisMismatch {
+        /// The configured genesis manifest entry id.
+        expected: String,
+        /// The entry id actually found.
+        found: String,
     },
 
     /// A checkpoint's signature does not verify against its resolved key.
@@ -162,24 +210,22 @@ pub enum MirrorError {
     #[error("checkpoint.raw does not match the assembled 98-byte blob")]
     RawBlobMismatch,
 
-    /// A new checkpoint's `tree_size` does not strictly exceed the series' current maximum
-    /// (adaptor profile §5.2.2 item 4: append-only, ordered by `tree_size`).
-    #[error("checkpoint tree_size {got} does not exceed the series maximum {maximum}")]
-    NonMonotonicTreeSize {
-        /// The series' current maximum `tree_size`.
-        maximum: u64,
-        /// The submitted checkpoint's `tree_size`.
-        got: u64,
+    /// A checkpoint with this `tree_size` is already in the series with different content
+    /// (adaptor profile §5.2.2 item 4: append-only in publication — a published member is
+    /// never withdrawn or replaced).
+    #[error("tree_size {tree_size} is already in the series with different content")]
+    SeriesMemberConflict {
+        /// The conflicting `tree_size`.
+        tree_size: u64,
     },
 
-    /// A new checkpoint is not consistent with the series' predecessor — the gap-free
-    /// requirement of adaptor profile §5.2.2 item 1 cannot be met.
-    #[error(
-        "checkpoint at tree_size {tree_size} is not consistent with the predecessor at {predecessor_tree_size}"
-    )]
-    InconsistentWithPredecessor {
-        /// The predecessor's `tree_size`.
-        predecessor_tree_size: u64,
+    /// A new checkpoint is not consistent with an already-admitted neighbour (predecessor
+    /// or successor by `tree_size`) — the gap-free requirement of adaptor profile §5.2.2
+    /// item 1 cannot be met.
+    #[error("checkpoint at tree_size {tree_size} is not consistent with the neighbour at {neighbour_tree_size}")]
+    InconsistentWithNeighbour {
+        /// The neighbour's `tree_size`.
+        neighbour_tree_size: u64,
         /// The new checkpoint's `tree_size`.
         tree_size: u64,
     },

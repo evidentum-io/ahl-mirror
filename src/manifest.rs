@@ -1,81 +1,95 @@
-//! Governance: resolving checkpoint-signing keys and cadence.
+//! Governance: a verified chain of `manifest`/`key` statements, rooted at a configured
+//! genesis anchor, giving checkpoint-signing keys and cadence (core spec §7.3; §2.3.5).
 //!
-//! Reads the `manifest` entries this mirror already holds canonically (adaptor profile
-//! §7.3; core spec §2.3.5, §7.2), bootstrapped from the genesis anchor in
-//! [`crate::config::Config`].
+//! # Governance statements are not self-authorizing
 //!
-//! # Schema assumption — reported, not quietly picked
+//! Anchoring proves bytes existed at a position; it does not make a governance statement
+//! effective (core spec §7.3, "Governance statements are not self-authorizing"). This module
+//! therefore does not trust a `manifest`-typed entry merely because it is canonical. A
+//! candidate counts only if:
 //!
-//! Core spec §7.2 describes the manifest object's `log` block in prose — "the log's
-//! checkpoint-signing key objects `{key_id, pubkey, valid_from_index}`" and "checkpoint
-//! cadence" — without a literal JSON example, unlike the statement types of §2.3.1-§2.3.6,
-//! which all get one. This module reads a manifest payload shaped:
+//! - it is the **genesis** manifest — its entry id equals
+//!   [`crate::config::Config::genesis_manifest_entry_id`] and its producer signature verifies
+//!   under [`crate::config::Config::genesis_producer_keys`] (the out-of-band trust anchor,
+//!   core spec §2.3.5) — or
+//! - it is a **non-genesis** manifest whose `predecessor` field names the entry id of the
+//!   currently active version and whose producer signature verifies under *that* version's
+//!   current producer key set, and whose `log.cadence_epoch` is unchanged from genesis (core
+//!   spec §7.3: "the epoch anchors the start of the series and never moves");
 //!
-//! ```text
-//! { "type": "manifest",
-//!   "log": { "keys": [ { "key_id", "pubkey", "valid_from_index" }, ... ],
-//!            "checkpoint_cadence_seconds": <u64> } }
-//! ```
+//! and a `key` statement counts only if its producer signature verifies under the producer
+//! key set currently in force. A candidate failing its check is not governance: it is simply
+//! skipped, and the walk continues from whatever the last genuinely verified state was.
 //!
-//! `log.keys` uses the key-object shape the profile gives verbatim elsewhere. The field
-//! names `log.keys` and `log.checkpoint_cadence_seconds` (a plain count of seconds, rather
-//! than an ISO 8601 duration or some other encoding) are this crate's own reasonable
-//! reading, not a quotation — flagged here and in `README.md` as a gap the next profile
-//! revision should close with an actual JSON example, the same way §2.3.1-§2.3.6 have one.
+//! # Schema
 //!
-//! # What is, and is not, checked
-//!
-//! A `manifest` entry is trusted here purely because of *where* it sits: at an entry index
-//! below the checkpoint being resolved, in the canonical (proof-admitted) sequence this
-//! mirror holds. That is exactly the resolution rule core spec §2.3.5 states — "the manifest
-//! version active at entry index i is mechanically resolvable from the log" is a claim about
-//! *position*, not about signature chains. This module does **not** validate the manifest's
-//! own producer signature, its `predecessor` linkage back to genesis, or that it was itself
-//! issued by a key valid under the previous manifest version — those are statement-graph and
-//! producer-signature concerns core spec §6 assigns to a verifier, outside this crate's
-//! declared scope (see `README.md`, "What this crate is not"). Trusting anchoring position
-//! rather than the full governance chain is the cost of resolving checkpoint keys without a
-//! verifier in the loop; it is reported here as the narrowest reading that discharges the
-//! requirement, not offered as a full manifest verifier.
+//! Core spec §7.3 gives the manifest `log` object's schema normatively:
+//! `{ "log_id", "operator", "adaptor": {"id","hash"}, "checkpoint_cadence", "cadence_epoch",
+//! "witness_grace_period", "keys": [{"key_id","pubkey","valid_from_index"}] }`, every member
+//! required; `checkpoint_cadence`/`witness_grace_period` are ISO 8601 durations (see
+//! [`crate::duration`] for the parsed subset), `cadence_epoch` is RFC 3339. The manifest's
+//! top-level `keys` array (core spec §7.2) is the producer-key snapshot, in the same
+//! `{key_id, pubkey, valid_from_index}` shape.
+
+use std::collections::HashMap;
 
 use ed25519_dalek::VerifyingKey;
 use serde::Deserialize;
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
-use crate::config::{Config, TrustedLogKey, TrustedLogKeySpec};
+use crate::config::{Config, KeyObjectSpec, ResolvedKeyObject};
+use crate::duration::parse_iso8601_duration_nanos;
 use crate::error::{MirrorError, MirrorResult};
-use crate::store::Store;
 
-/// The `log` block of a `manifest` payload, per this module's schema assumption above.
-#[derive(Debug, Clone, Deserialize)]
-struct ManifestLogBlock {
-    #[serde(default)]
-    keys: Vec<TrustedLogKeySpec>,
-    #[serde(default)]
-    checkpoint_cadence_seconds: Option<u64>,
+#[derive(Debug, Deserialize)]
+struct AdaptorBlock {
+    #[allow(dead_code)]
+    id: String,
+    #[allow(dead_code)]
+    hash: String,
 }
 
-/// A resolved governance snapshot: the checkpoint-signing key set and cadence active at some
-/// `tree_size`, whether from an anchored manifest or from genesis configuration.
+#[derive(Debug, Deserialize)]
+struct LogBlock {
+    log_id: String,
+    #[allow(dead_code)]
+    operator: String,
+    #[allow(dead_code)]
+    adaptor: AdaptorBlock,
+    checkpoint_cadence: String,
+    cadence_epoch: String,
+    #[allow(dead_code)]
+    witness_grace_period: String,
+    keys: Vec<KeyObjectSpec>,
+}
+
+/// A verified governance snapshot: the producer and checkpoint-signing key sets, and cadence
+/// material, in force at the point a chain walk reached.
 #[derive(Debug, Clone)]
-pub struct GovernanceSnapshot {
-    keys: Vec<TrustedLogKey>,
-    cadence_seconds: Option<u64>,
+pub struct GovernanceState {
+    producer_keys: HashMap<String, ResolvedKeyObject>,
+    log_keys: Vec<ResolvedKeyObject>,
+    cadence_nanos: u64,
+    cadence_epoch_nanos: u64,
+    governing_manifest_entry_index: u64,
+    governing_manifest_entry_id: String,
+    genesis_entry_index: u64,
 }
 
-impl GovernanceSnapshot {
-    /// Resolve the signing key for `key_id`, honouring the activation bound (adaptor profile
-    /// §7.3): retirement is implicit, since a key not present in the *active* snapshot —
-    /// because a later manifest version replaced the set without it — is simply not found.
+impl GovernanceState {
+    /// Resolve the checkpoint-signing key for `key_id`, honouring its activation bound (core
+    /// spec §7.3). Retirement is implicit: a key absent from the *current* version's
+    /// `log.keys` — because a later version replaced the set without it — is simply not
+    /// found.
     ///
     /// # Errors
     ///
-    /// [`MirrorError::UnknownSigningKey`] if no key with this id is in the active set, or
-    /// [`MirrorError::KeyNotYetActive`] if it is present but its `valid_from_index` exceeds
-    /// `tree_size`.
-    pub fn resolve_key(&self, key_id: &str, tree_size: u64) -> MirrorResult<&VerifyingKey> {
+    /// [`MirrorError::UnknownSigningKey`] or [`MirrorError::KeyNotYetActive`].
+    pub fn resolve_log_key(&self, key_id: &str, tree_size: u64) -> MirrorResult<&VerifyingKey> {
         let key = self
-            .keys
+            .log_keys
             .iter()
             .find(|k| k.key_id == key_id)
             .ok_or_else(|| MirrorError::UnknownSigningKey { key_id: key_id.to_owned() })?;
@@ -89,223 +103,498 @@ impl GovernanceSnapshot {
         Ok(&key.verifying_key)
     }
 
-    /// The declared checkpoint cadence, if this snapshot's source declares one. `None` means
-    /// cadence is unknown, which makes `ITUB` unavailable (adaptor profile §5.2.2).
+    /// The `checkpoint_cadence` in force, as a nanosecond duration (core spec §7.3).
     #[must_use]
-    pub const fn cadence_seconds(&self) -> Option<u64> {
-        self.cadence_seconds
+    pub const fn cadence_nanos(&self) -> u64 {
+        self.cadence_nanos
+    }
+
+    /// `cadence_epoch`, as unix nanoseconds — fixed for the whole corpus by the genesis
+    /// manifest (core spec §7.3).
+    #[must_use]
+    pub const fn cadence_epoch_nanos(&self) -> u64 {
+        self.cadence_epoch_nanos
+    }
+
+    /// The entry index of the manifest version currently governing.
+    #[must_use]
+    pub const fn governing_manifest_entry_index(&self) -> u64 {
+        self.governing_manifest_entry_index
+    }
+
+    /// The entry index of the verified genesis manifest — fixed for the whole corpus. A
+    /// checkpoint whose `tree_size` equals `genesis_entry_index + 1` covers nothing but the
+    /// genesis manifest itself: nothing could exist before it (core spec §7.3, "a checkpoint
+    /// whose predecessor is the genesis state").
+    #[must_use]
+    pub const fn genesis_entry_index(&self) -> u64 {
+        self.genesis_entry_index
     }
 }
 
-/// Resolve the governance snapshot active for a checkpoint at `tree_size`.
-///
-/// That snapshot comes from the `manifest` entry with the greatest entry index below
-/// `tree_size` among this mirror's *canonical* entries, or from the genesis configuration if
-/// none has been anchored yet.
-///
-/// Scans only entries already promoted via [`crate::store::Store::promote_entry`] — never
-/// staged, unverified bytes — so a party with no authority over the log cannot influence
-/// which keys or cadence this function returns.
-///
-/// If `tree_size` exceeds how many entries are canonical, this deliberately does **not**
-/// error: it resolves against whatever prefix of `[0, tree_size)` the mirror actually holds
-/// canonically (possibly a strict, shorter prefix — [`crate::store::Store::get_entries_range`]
-/// never errors on an incomplete range, it just returns fewer rows). A manifest rotation
-/// could in principle be hiding in the unseen remainder, but that cannot make this function
-/// resolve against something *false*: it can only make it resolve against a set that is
-/// stale (missing a rotation that truly happened later in the range) or, if the rotation
-/// hides a retirement, no longer current. Either way the checkpoint being verified with this
-/// snapshot then fails signature/activation checking on its own, safely and without a
-/// separate "unresolvable" error class — see [`crate::checkpoint::ingest_checkpoint`]'s docs
-/// for why entries a checkpoint submission is simultaneously trying to promote must never be
-/// consulted here regardless.
-///
-/// # Errors
-///
-/// [`MirrorError::GenesisMismatch`] if a configured genesis entry id is set and the first
-/// manifest entry found does not match it, or a store error.
-pub fn resolve(store: &Store, config: &Config, tree_size: u64) -> MirrorResult<GovernanceSnapshot> {
-    let entries = store.get_entries_range(0, tree_size)?;
-    let mut first_manifest_entry_id: Option<String> = None;
-    let mut active: Option<ManifestLogBlock> = None;
+fn resolver_from_map(
+    keys: &HashMap<String, ResolvedKeyObject>,
+    at_index: u64,
+) -> impl Fn(&str) -> Option<String> + '_ {
+    move |key_id| {
+        let key = keys.get(key_id)?;
+        (key.valid_from_index <= at_index).then(|| key.pubkey.clone())
+    }
+}
 
-    for bytes in &entries {
-        let Ok(value) = serde_json::from_slice::<Value>(bytes) else { continue };
-        let Some(payload) = value.get("payload") else { continue };
-        let Some(kind) = payload.get("type").and_then(Value::as_str) else { continue };
-        if kind != "manifest" {
-            continue;
+fn resolver_from_slice(
+    keys: &[ResolvedKeyObject],
+    at_index: u64,
+) -> impl Fn(&str) -> Option<String> + '_ {
+    move |key_id| {
+        let key = keys.iter().find(|k| k.key_id == key_id)?;
+        (key.valid_from_index <= at_index).then(|| key.pubkey.clone())
+    }
+}
+
+/// Parse an RFC 3339 timestamp to unix nanoseconds.
+fn parse_rfc3339_nanos(value: &str) -> MirrorResult<u64> {
+    let bad = || MirrorError::BadCadenceEpoch { value: value.to_owned() };
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| bad())?;
+    u64::try_from(parsed.unix_timestamp_nanos()).map_err(|_| bad())
+}
+
+/// Try to build a [`GovernanceState`] from a candidate manifest payload's `log` block and
+/// top-level producer `keys` array. Returns `None` (not an error) for any schema or content
+/// defect — a malformed manifest is simply not valid governance, core spec §7.3.
+fn parse_governance(
+    payload: &Value,
+    entry_index: u64,
+    entry_id: String,
+    log_id: &str,
+    genesis_entry_index: u64,
+    required_epoch_nanos: Option<u64>,
+) -> Option<GovernanceState> {
+    let producer_keys_value = payload.get("keys")?.clone();
+    let producer_key_specs: Vec<KeyObjectSpec> =
+        serde_json::from_value(producer_keys_value).ok()?;
+    let mut producer_keys = HashMap::new();
+    for spec in &producer_key_specs {
+        let resolved = ResolvedKeyObject::resolve(spec).ok()?;
+        producer_keys.insert(resolved.key_id.clone(), resolved);
+    }
+
+    let log_value = payload.get("log")?.clone();
+    let log_block: LogBlock = serde_json::from_value(log_value).ok()?;
+    if log_block.log_id != log_id {
+        return None;
+    }
+    let cadence_nanos = parse_iso8601_duration_nanos(&log_block.checkpoint_cadence).ok()?;
+    // Required present and parseable, though this crate does not otherwise act on it.
+    let _witness_grace_period =
+        parse_iso8601_duration_nanos(&log_block.witness_grace_period).ok()?;
+    let cadence_epoch_nanos = parse_rfc3339_nanos(&log_block.cadence_epoch).ok()?;
+    if let Some(required) = required_epoch_nanos {
+        if cadence_epoch_nanos != required {
+            return None; // "a later version declaring a different epoch is malformed"
         }
-        if first_manifest_entry_id.is_none() {
-            first_manifest_entry_id = Some(ahl_core::entry_id(&value));
+    }
+
+    let mut log_keys = Vec::with_capacity(log_block.keys.len());
+    for spec in &log_block.keys {
+        log_keys.push(ResolvedKeyObject::resolve(spec).ok()?);
+    }
+
+    Some(GovernanceState {
+        producer_keys,
+        log_keys,
+        cadence_nanos,
+        cadence_epoch_nanos,
+        governing_manifest_entry_index: entry_index,
+        governing_manifest_entry_id: entry_id,
+        genesis_entry_index,
+    })
+}
+
+fn try_apply_manifest(
+    state: &mut Option<GovernanceState>,
+    envelope: &Value,
+    payload: &Value,
+    entry_index: u64,
+    config: &Config,
+) -> MirrorResult<()> {
+    let entry_id = ahl_core::entry_id(envelope);
+    match state {
+        None => {
+            if entry_id != config.genesis_manifest_entry_id {
+                return Ok(());
+            }
+            if payload.get("predecessor").is_some() {
+                return Ok(()); // predecessor is forbidden for genesis
+            }
+            let resolve = resolver_from_slice(&config.genesis_producer_keys, entry_index);
+            if !ahl_core::verify_envelope(envelope, resolve)? {
+                return Ok(());
+            }
+            *state =
+                parse_governance(payload, entry_index, entry_id, &config.log_id, entry_index, None);
         }
-        if let Some(log_value) = payload.get("log") {
-            if let Ok(log) = serde_json::from_value::<ManifestLogBlock>(log_value.clone()) {
-                active = Some(log);
+        Some(current) => {
+            let Some(predecessor) = payload.get("predecessor").and_then(Value::as_str) else {
+                return Ok(());
+            };
+            if predecessor != current.governing_manifest_entry_id {
+                return Ok(());
+            }
+            let resolve = resolver_from_map(&current.producer_keys, entry_index);
+            if !ahl_core::verify_envelope(envelope, resolve)? {
+                return Ok(());
+            }
+            let next = parse_governance(
+                payload,
+                entry_index,
+                entry_id,
+                &config.log_id,
+                current.genesis_entry_index,
+                Some(current.cadence_epoch_nanos),
+            );
+            if let Some(next) = next {
+                *state = Some(next);
             }
         }
     }
+    Ok(())
+}
 
-    if let (Some(expected), Some(found)) =
-        (&config.genesis_manifest_entry_id, &first_manifest_entry_id)
-    {
-        if expected != found {
-            return Err(MirrorError::GenesisMismatch {
-                expected: expected.clone(),
-                found: found.clone(),
-            });
-        }
+fn try_apply_key(
+    state: &mut GovernanceState,
+    envelope: &Value,
+    payload: &Value,
+    entry_index: u64,
+) -> MirrorResult<()> {
+    let Some(action) = payload.get("action").and_then(Value::as_str) else { return Ok(()) };
+    let Some(key_value) = payload.get("key") else { return Ok(()) };
+    let Ok(key_spec) = serde_json::from_value::<KeyObjectSpec>(key_value.clone()) else {
+        return Ok(());
+    };
+
+    let resolve = resolver_from_map(&state.producer_keys, entry_index);
+    if !ahl_core::verify_envelope(envelope, resolve)? {
+        return Ok(());
     }
 
-    match active {
-        Some(log) => {
-            let keys =
-                log.keys.iter().map(TrustedLogKey::resolve).collect::<MirrorResult<Vec<_>>>()?;
-            Ok(GovernanceSnapshot { keys, cadence_seconds: log.checkpoint_cadence_seconds })
+    match action {
+        "add" => {
+            if let Ok(resolved) = ResolvedKeyObject::resolve(&key_spec) {
+                state.producer_keys.insert(resolved.key_id.clone(), resolved);
+            }
         }
-        None => Ok(GovernanceSnapshot {
-            keys: config.keys.clone(),
-            cadence_seconds: config.genesis_checkpoint_cadence_seconds,
-        }),
+        "retire" => {
+            state.producer_keys.remove(&key_spec.key_id);
+        }
+        _ => {}
     }
+    Ok(())
+}
+
+/// Walk `entries_prefix` and return the governance state active at the end of it.
+///
+/// `entries_prefix` MUST be the complete, contiguous entry sequence
+/// `[0, entries_prefix.len())`; every `manifest`/`key` statement it contains is verified
+/// along the way.
+///
+/// # Errors
+///
+/// Returns [`MirrorError::GovernanceChainUnresolvable`] if no verified genesis manifest is
+/// reached within `entries_prefix` (whether because it is not there yet, or because no entry
+/// verifies as the configured genesis anchor).
+pub fn resolve(entries_prefix: &[Vec<u8>], config: &Config) -> MirrorResult<GovernanceState> {
+    let mut state: Option<GovernanceState> = None;
+    for (i, bytes) in entries_prefix.iter().enumerate() {
+        let index =
+            u64::try_from(i).map_err(|_| MirrorError::IndexOverflow { what: "entry index" })?;
+        let Ok(envelope) = serde_json::from_slice::<Value>(bytes) else { continue };
+        let Some(payload) = envelope.get("payload") else { continue };
+        let Some(kind) = payload.get("type").and_then(Value::as_str) else { continue };
+        match kind {
+            "manifest" => try_apply_manifest(&mut state, &envelope, payload, index, config)?,
+            "key" => {
+                if let Some(current) = state.as_mut() {
+                    try_apply_key(current, &envelope, payload, index)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    let tree_size = u64::try_from(entries_prefix.len())
+        .map_err(|_| MirrorError::IndexOverflow { what: "entries_prefix.len()" })?;
+    state.ok_or(MirrorError::GovernanceChainUnresolvable { tree_size })
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use sha2::Digest as _;
 
     use super::*;
     use crate::config::ConfigSpec;
 
-    fn key() -> ahl_core::TestKey {
-        ahl_core::TestKey::from_seed_hex("log-1", &"aa".repeat(32)).expect("32-byte seed")
-    }
-
-    fn config_with_genesis(k: &ahl_core::TestKey, genesis_id: Option<&str>) -> Config {
+    fn config_with(genesis: &ahl_core::TestKey, genesis_entry_id: &str) -> Config {
         Config::resolve(&ConfigSpec {
             log_id: "sha256:aa".to_owned(),
-            keys: vec![TrustedLogKeySpec {
-                key_id: k.key_id(),
-                pubkey: k.pubkey(),
+            genesis_manifest_entry_id: genesis_entry_id.to_owned(),
+            genesis_producer_keys: vec![KeyObjectSpec {
+                key_id: genesis.key_id(),
+                pubkey: genesis.pubkey(),
                 valid_from_index: 0,
             }],
-            genesis_manifest_entry_id: genesis_id.map(str::to_owned),
-            genesis_checkpoint_cadence_seconds: Some(60),
             store_path: ":memory:".to_owned(),
         })
         .expect("valid config")
     }
 
-    fn manifest_entry(producer_key: &ahl_core::TestKey, log_keys: &Value) -> Vec<u8> {
+    fn log_block(log_id: &str, cadence: &str, epoch: &str, keys: &Value) -> Value {
+        json!({
+            "log_id": log_id,
+            "operator": "op-1",
+            "adaptor": { "id": "ahl-adaptor-atl-v1", "hash": "sha256:00" },
+            "checkpoint_cadence": cadence,
+            "cadence_epoch": epoch,
+            "witness_grace_period": "PT10M",
+            "keys": keys,
+        })
+    }
+
+    fn genesis_manifest(
+        producer: &ahl_core::TestKey,
+        log_id: &str,
+        producer_keys: &Value,
+        log_keys: &Value,
+        epoch: &str,
+    ) -> Value {
         let payload = json!({
             "type": "manifest",
-            "log": { "keys": log_keys, "checkpoint_cadence_seconds": 120 },
+            "producer": "producer-1",
+            "keys": producer_keys,
+            "log": log_block(log_id, "PT5M", epoch, log_keys),
         });
-        ahl_core::jcs(&ahl_core::envelope(payload, producer_key))
+        ahl_core::envelope(payload, producer)
+    }
+
+    fn entry_id_of(envelope: &Value) -> String {
+        ahl_core::entry_id(envelope)
+    }
+
+    fn producer_key_array(k: &ahl_core::TestKey) -> Value {
+        json!([{ "key_id": k.key_id(), "pubkey": k.pubkey(), "valid_from_index": 0 }])
     }
 
     #[test]
-    fn with_no_manifest_yet_genesis_configuration_governs() {
-        let k = key();
-        let store = Store::open_in_memory().expect("in-memory store");
-        let config = config_with_genesis(&k, None);
-        let snapshot = resolve(&store, &config, 0).expect("empty range resolves");
-        assert_eq!(snapshot.cadence_seconds(), Some(60));
-        assert!(snapshot.resolve_key(&k.key_id(), 0).is_ok());
-    }
-
-    #[test]
-    fn resolving_past_what_is_canonical_falls_back_to_genesis_safely() {
-        // No entries are canonical yet, so there is nothing to find a manifest rotation in;
-        // resolution does not error, it just uses genesis — and a checkpoint verified
-        // against that snapshot will fail its own signature check if it was really signed
-        // under a rotation this mirror has not seen (see `ingest_checkpoint`'s docs).
-        let store = Store::open_in_memory().expect("in-memory store");
-        let k = key();
-        let config = config_with_genesis(&k, None);
-        let snapshot = resolve(&store, &config, 5).expect("resolves against genesis");
-        assert!(snapshot.resolve_key(&k.key_id(), 5).is_ok());
-    }
-
-    #[test]
-    fn a_manifest_rotation_replaces_the_genesis_set_in_full() {
-        let genesis_key = key();
-        let rotated_key =
-            ahl_core::TestKey::from_seed_hex("log-2", &"bb".repeat(32)).expect("seed");
+    fn a_verified_genesis_manifest_establishes_governance() {
         let producer =
-            ahl_core::TestKey::from_seed_hex("producer", &"cc".repeat(32)).expect("producer seed");
-
-        let store = Store::open_in_memory().expect("in-memory store");
-        let manifest_bytes = manifest_entry(
+            ahl_core::TestKey::from_seed_hex("producer", &"01".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"02".repeat(32)).expect("seed");
+        let genesis_env = genesis_manifest(
             &producer,
-            &json!([{
-                "key_id": rotated_key.key_id(),
-                "pubkey": rotated_key.pubkey(),
-                "valid_from_index": 1,
-            }]),
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
         );
-        let manifest_id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&manifest_bytes)));
-        store.stage_entry(&manifest_id, &manifest_bytes).expect("stage");
-        store.promote_entry(0, &manifest_id).expect("promote");
+        let genesis_id = entry_id_of(&genesis_env);
+        let config = config_with(&producer, &genesis_id);
+        let bytes = ahl_core::jcs(&genesis_env);
 
-        let config = config_with_genesis(&genesis_key, None);
-
-        // Below the manifest entry: genesis key set still governs.
-        let before = resolve(&store, &config, 0).expect("resolves");
-        assert!(before.resolve_key(&genesis_key.key_id(), 0).is_ok());
-
-        // At or above it: only the rotated key is recognised.
-        let after = resolve(&store, &config, 1).expect("resolves");
-        assert!(matches!(
-            after.resolve_key(&genesis_key.key_id(), 1),
-            Err(MirrorError::UnknownSigningKey { .. })
-        ));
-        assert!(after.resolve_key(&rotated_key.key_id(), 1).is_ok());
-        assert_eq!(after.cadence_seconds(), Some(120));
+        let state = resolve(&[bytes], &config).expect("genesis verifies");
+        assert_eq!(state.genesis_entry_index(), 0);
+        assert_eq!(state.governing_manifest_entry_index(), 0);
+        assert!(state.resolve_log_key(&log_key.key_id(), 0).is_ok());
+        assert_eq!(state.cadence_nanos(), 300_000_000_000);
     }
 
     #[test]
-    fn a_key_below_its_activation_bound_is_rejected() {
-        let genesis_key = key();
-        let rotated_key =
-            ahl_core::TestKey::from_seed_hex("log-2", &"dd".repeat(32)).expect("seed");
+    fn a_manifest_with_an_invalid_producer_signature_is_not_governance() {
         let producer =
-            ahl_core::TestKey::from_seed_hex("producer", &"ee".repeat(32)).expect("producer seed");
-
-        let store = Store::open_in_memory().expect("in-memory store");
-        let manifest_bytes = manifest_entry(
-            &producer,
-            &json!([{
-                "key_id": rotated_key.key_id(),
-                "pubkey": rotated_key.pubkey(),
-                "valid_from_index": 100,
-            }]),
+            ahl_core::TestKey::from_seed_hex("producer", &"03".repeat(32)).expect("seed");
+        let impostor =
+            ahl_core::TestKey::from_seed_hex("impostor", &"04".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"05".repeat(32)).expect("seed");
+        // Signed by a key never trusted as the genesis producer.
+        let genesis_env = genesis_manifest(
+            &impostor,
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
         );
-        let manifest_id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&manifest_bytes)));
-        store.stage_entry(&manifest_id, &manifest_bytes).expect("stage");
-        store.promote_entry(0, &manifest_id).expect("promote");
+        let genesis_id = entry_id_of(&genesis_env);
+        let config = config_with(&producer, &genesis_id);
+        let bytes = ahl_core::jcs(&genesis_env);
 
-        let config = config_with_genesis(&genesis_key, None);
-        let snapshot = resolve(&store, &config, 1).expect("resolves");
         assert!(matches!(
-            snapshot.resolve_key(&rotated_key.key_id(), 1),
-            Err(MirrorError::KeyNotYetActive { valid_from_index: 100, tree_size: 1, .. })
+            resolve(&[bytes], &config),
+            Err(MirrorError::GovernanceChainUnresolvable { .. })
         ));
     }
 
     #[test]
-    fn a_genesis_mismatch_refuses_resolution() {
-        let genesis_key = key();
+    fn a_manifest_with_a_bad_predecessor_link_is_not_governance() {
         let producer =
-            ahl_core::TestKey::from_seed_hex("producer", &"ff".repeat(32)).expect("producer seed");
-        let store = Store::open_in_memory().expect("in-memory store");
-        let manifest_bytes = manifest_entry(&producer, &json!([]));
-        let manifest_id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&manifest_bytes)));
-        store.stage_entry(&manifest_id, &manifest_bytes).expect("stage");
-        store.promote_entry(0, &manifest_id).expect("promote");
+            ahl_core::TestKey::from_seed_hex("producer", &"06".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"07".repeat(32)).expect("seed");
+        let genesis_env = genesis_manifest(
+            &producer,
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
+        );
+        let genesis_id = entry_id_of(&genesis_env);
+        let config = config_with(&producer, &genesis_id);
 
-        let config = config_with_genesis(&genesis_key, Some("sha256:not-the-real-genesis"));
-        assert!(matches!(resolve(&store, &config, 1), Err(MirrorError::GenesisMismatch { .. })));
+        let rotated_log_key =
+            ahl_core::TestKey::from_seed_hex("log-2", &"08".repeat(32)).expect("seed");
+        let bad_next_payload = json!({
+            "type": "manifest",
+            "producer": "producer-1",
+            "predecessor": "sha256:not-the-genesis-entry-id",
+            "keys": producer_key_array(&producer),
+            "log": log_block(
+                "sha256:aa", "PT5M", "2026-01-01T00:00:00Z", &producer_key_array(&rotated_log_key)
+            ),
+        });
+        let bad_next_env = ahl_core::envelope(bad_next_payload, &producer);
+
+        let entries = vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&bad_next_env)];
+        let state = resolve(&entries, &config).expect("genesis alone still resolves");
+        // The bad rotation never took effect: the genesis log key is still the active one.
+        assert!(state.resolve_log_key(&log_key.key_id(), 1).is_ok());
+        assert!(state.resolve_log_key(&rotated_log_key.key_id(), 1).is_err());
+    }
+
+    #[test]
+    fn a_later_manifest_changing_the_epoch_is_malformed_and_ignored() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"09".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"0a".repeat(32)).expect("seed");
+        let genesis_env = genesis_manifest(
+            &producer,
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
+        );
+        let genesis_id = entry_id_of(&genesis_env);
+        let config = config_with(&producer, &genesis_id);
+
+        let rotated_log_key =
+            ahl_core::TestKey::from_seed_hex("log-2", &"0b".repeat(32)).expect("seed");
+        let next_payload = json!({
+            "type": "manifest",
+            "producer": "producer-1",
+            "predecessor": genesis_id,
+            "keys": producer_key_array(&producer),
+            // Different epoch than genesis declared: malformed per core spec §7.3.
+            "log": log_block(
+                "sha256:aa", "PT5M", "2026-06-01T00:00:00Z", &producer_key_array(&rotated_log_key)
+            ),
+        });
+        let next_env = ahl_core::envelope(next_payload, &producer);
+
+        let entries = vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&next_env)];
+        let state = resolve(&entries, &config).expect("genesis still resolves");
+        assert!(state.resolve_log_key(&log_key.key_id(), 1).is_ok());
+        assert!(state.resolve_log_key(&rotated_log_key.key_id(), 1).is_err());
+    }
+
+    #[test]
+    fn a_valid_rotation_replaces_the_log_key_set_and_keeps_the_epoch() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"0c".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"0d".repeat(32)).expect("seed");
+        let genesis_env = genesis_manifest(
+            &producer,
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
+        );
+        let genesis_id = entry_id_of(&genesis_env);
+        let config = config_with(&producer, &genesis_id);
+
+        let rotated_log_key =
+            ahl_core::TestKey::from_seed_hex("log-2", &"0e".repeat(32)).expect("seed");
+        let next_payload = json!({
+            "type": "manifest",
+            "producer": "producer-1",
+            "predecessor": genesis_id,
+            "keys": producer_key_array(&producer),
+            "log": log_block(
+                "sha256:aa", "PT1M", "2026-01-01T00:00:00Z", &producer_key_array(&rotated_log_key)
+            ),
+        });
+        let next_env = ahl_core::envelope(next_payload, &producer);
+
+        let entries = vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&next_env)];
+        let state = resolve(&entries, &config).expect("valid rotation resolves");
+        assert_eq!(state.governing_manifest_entry_index(), 1);
+        assert_eq!(state.genesis_entry_index(), 0);
+        assert_eq!(state.cadence_nanos(), 60_000_000_000);
+        assert!(state.resolve_log_key(&rotated_log_key.key_id(), 1).is_ok());
+        // Retired: the version-1 manifest replaced the log key set in full.
+        assert!(state.resolve_log_key(&log_key.key_id(), 1).is_err());
+    }
+
+    #[test]
+    fn an_empty_prefix_is_unresolvable() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"0f".repeat(32)).expect("seed");
+        let config = config_with(&producer, "sha256:never-seen");
+        assert!(matches!(
+            resolve(&[], &config),
+            Err(MirrorError::GovernanceChainUnresolvable { tree_size: 0 })
+        ));
+    }
+
+    #[test]
+    fn a_key_statement_rotates_producer_keys_and_gates_later_manifests() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"10".repeat(32)).expect("seed");
+        let producer_2 =
+            ahl_core::TestKey::from_seed_hex("producer-2", &"11".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"12".repeat(32)).expect("seed");
+        let genesis_env = genesis_manifest(
+            &producer,
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
+        );
+        let genesis_id = entry_id_of(&genesis_env);
+        let config = config_with(&producer, &genesis_id);
+
+        // A `key` statement adds producer_2, signed by the currently-valid producer.
+        let key_payload = json!({
+            "type": "key",
+            "action": "add",
+            "key": {
+                "key_id": producer_2.key_id(), "pubkey": producer_2.pubkey(), "valid_from_index": 1
+            },
+        });
+        let key_env = ahl_core::envelope(key_payload, &producer);
+
+        // A later manifest, signed by the newly added producer_2, links to genesis.
+        let rotated_log_key =
+            ahl_core::TestKey::from_seed_hex("log-2", &"13".repeat(32)).expect("seed");
+        let next_payload = json!({
+            "type": "manifest",
+            "producer": "producer-1",
+            "predecessor": genesis_id,
+            "keys": producer_key_array(&producer),
+            "log": log_block(
+                "sha256:aa", "PT5M", "2026-01-01T00:00:00Z", &producer_key_array(&rotated_log_key)
+            ),
+        });
+        let next_env = ahl_core::envelope(next_payload, &producer_2);
+
+        let entries =
+            vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&key_env), ahl_core::jcs(&next_env)];
+        let state = resolve(&entries, &config).expect("chain resolves");
+        assert_eq!(state.governing_manifest_entry_index(), 2);
+        assert!(state.resolve_log_key(&rotated_log_key.key_id(), 2).is_ok());
     }
 }

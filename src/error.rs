@@ -122,9 +122,18 @@ pub enum MirrorError {
         tree_size: u64,
     },
 
-    /// No checkpoint with this `tree_size` is in the canonical series.
-    #[error("no checkpoint with tree_size {tree_size} is in the canonical checkpoint series")]
+    /// No checkpoint with this `tree_size` is authenticated at all.
+    #[error("no authenticated checkpoint with tree_size {tree_size}")]
     UnknownCheckpoint {
+        /// The requested tree size.
+        tree_size: u64,
+    },
+
+    /// A checkpoint with this `tree_size` exists but is not (yet) series-usable — core spec
+    /// §7.3 permits only series-usable checkpoints to ground an enumeration response, an
+    /// incorporation-time bound, or a completeness claim.
+    #[error("checkpoint with tree_size {tree_size} is authenticated but not series-usable")]
+    CheckpointNotSeriesUsable {
         /// The requested tree size.
         tree_size: u64,
     },
@@ -186,17 +195,35 @@ pub enum MirrorError {
         tree_size: u64,
     },
 
-    /// The first `manifest`-typed canonical entry found does not match the configured
-    /// genesis anchor (core spec §2.3.5; receipt format's local-policy rule).
-    #[error(
-        "first manifest entry `{found}` does not match the configured genesis anchor `{expected}`"
-    )]
-    GenesisMismatch {
-        /// The configured genesis manifest entry id.
-        expected: String,
-        /// The entry id actually found.
-        found: String,
+    /// No verified governance snapshot (genesis manifest plus every subsequent verified
+    /// `manifest`/`key` statement) can be established up to this `tree_size` — either
+    /// because entries are not yet visible that far, or because no valid genesis manifest
+    /// (signature-verified against the configured out-of-band anchor) has been found. Refused
+    /// rather than resolved from an older or partial snapshot (core spec §7.3).
+    #[error("governance chain is not resolvable up to tree_size {tree_size}")]
+    GovernanceChainUnresolvable {
+        /// The `tree_size` governance resolution was attempted for.
+        tree_size: u64,
     },
+
+    /// A duration string is not a well-formed ISO 8601 duration (core spec §7.3 schema).
+    #[error("`{value}` is not a valid ISO 8601 duration")]
+    BadDuration {
+        /// The value as submitted.
+        value: String,
+    },
+
+    /// A `cadence_epoch` value is not a valid RFC 3339 timestamp (core spec §7.3 schema).
+    #[error("`{value}` is not a valid RFC 3339 cadence_epoch")]
+    BadCadenceEpoch {
+        /// The value as submitted.
+        value: String,
+    },
+
+    /// A configuration's genesis producer key set is empty; no governance chain can ever
+    /// start without at least one out-of-band trusted producer key (core spec §2.3.5).
+    #[error("configuration declares no genesis producer keys")]
+    NoGenesisProducerKeys,
 
     /// A checkpoint's signature does not verify against its resolved key.
     #[error("checkpoint signature does not verify against key `{key_id}`")]
@@ -210,13 +237,20 @@ pub enum MirrorError {
     #[error("checkpoint.raw does not match the assembled 98-byte blob")]
     RawBlobMismatch,
 
-    /// A checkpoint with this `tree_size` is already in the series with different content
-    /// (adaptor profile §5.2.2 item 4: append-only in publication — a published member is
-    /// never withdrawn or replaced).
-    #[error("tree_size {tree_size} is already in the series with different content")]
+    /// A checkpoint with this `(tree_size, checkpoint_time)` is already recorded with
+    /// different content (adaptor profile §5.2.2 item 4: append-only in publication — a
+    /// published member is never withdrawn or replaced). A *different* `checkpoint_time` at
+    /// the same `tree_size` is not a conflict — core spec §7.3 requires a quiet log to keep
+    /// publishing checkpoints at unchanged `tree_size`, so repeated sizes are legitimate,
+    /// distinct members.
+    #[error(
+        "tree_size {tree_size} at {checkpoint_time} is already recorded with different content"
+    )]
     SeriesMemberConflict {
         /// The conflicting `tree_size`.
         tree_size: u64,
+        /// The conflicting `checkpoint_time`.
+        checkpoint_time: String,
     },
 
     /// A new checkpoint is not consistent with an already-admitted neighbour (predecessor

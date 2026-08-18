@@ -113,6 +113,13 @@ pub enum FrontierStop {
         /// The `tree_size` governance resolution was attempted for.
         at_tree_size: u64,
     },
+    /// Two authenticated members share `at_tree_size` with different `root_hash` values —
+    /// equivocation, not a tie (core spec §7.3: "Equivocation ends the series"). Frontier
+    /// extension never reaches `at_tree_size` or beyond; see [`SeriesView::equivocation_floor`].
+    Equivocation {
+        /// The lowest `tree_size` at which two authenticated members diverge in `root_hash`.
+        at_tree_size: u64,
+    },
 }
 
 /// The computed view of the checkpoint series at the current moment (core spec §7.3).
@@ -132,8 +139,18 @@ pub struct SeriesView {
     /// `root_hash` values — a finding: core spec §7.3 requires members sharing a `tree_size`
     /// to carry the same `root_hash`, since a quiet log republishing at unchanged `tree_size`
     /// is legitimate but must still commit to one root. Detected purely from checkpoint
-    /// metadata (no entries need be held), independent of `gap_free_frontier`.
+    /// metadata (no entries need be held).
     pub root_divergences: Vec<u64>,
+    /// The lowest `tree_size` in `root_divergences`, if any — core spec §7.3: "from the
+    /// lowest `tree_size` at which it occurs, the series is no longer canonical: no
+    /// incorporation bound, enumeration response or completeness claim may be grounded at or
+    /// beyond that point … members below the divergence remain usable." `gap_free_frontier`
+    /// (and therefore `itub`) never reaches or passes this value — see
+    /// `compute_gap_free_frontier`'s `equivocation_floor` parameter — and callers grounding an
+    /// enumeration or consistency response MUST independently refuse any `tree_size >=` this
+    /// value, since a checkpoint's own root recomputing correctly against entries this mirror
+    /// happens to hold does not un-equivocate a log that published a conflicting root too.
+    pub equivocation_floor: Option<u64>,
 }
 
 /// Find every `tree_size` at which two adjacent members of `checkpoints` (ordered ascending
@@ -499,7 +516,14 @@ struct GapFreeResult {
 /// - "members sharing a `tree_size` MUST carry the same `root_hash`" (the ordering paragraph;
 ///   see [`SeriesView::root_divergences`], computed separately in [`series_view`], since it
 ///   applies to authenticated members generally, not only the series-usable subset this
-///   function walks).
+///   function walks) — and "Equivocation ends the series": "from the lowest `tree_size` at
+///   which it occurs, the series is no longer canonical: no incorporation bound, enumeration
+///   response or completeness claim may be grounded at or beyond that point … Members below
+///   the divergence remain usable." `equivocation_floor` (the lowest divergent `tree_size`,
+///   `None` if there is none) implements exactly this: frontier extension refuses to start at
+///   or reach a member whose `tree_size >= equivocation_floor`, so `gap_free_frontier` (and
+///   therefore [`itub`]) never grounds anything at or beyond it, while members strictly below
+///   it are judged exactly as before.
 ///
 /// "`checkpoint_cadence` values are compared by normalized value, not by spelling: `PT60M` and
 /// `PT1H` are the same cadence. A later manifest version repeating `cadence_epoch` repeats it
@@ -516,10 +540,27 @@ fn compute_gap_free_frontier(
     store: &Store,
     config: &Config,
     usable: &[Checkpoint],
+    equivocation_floor: Option<u64>,
 ) -> MirrorResult<GapFreeResult> {
+    // No future arrival of entries or checkpoints can un-equivocate a log that already
+    // published two conflicting roots (core spec §7.3): once `equivocation_floor` is known,
+    // it is the reason nothing at or beyond it will ever be reported clean — not silence —
+    // even where a plain lack of series-usable members would otherwise explain the stop just
+    // as well. This governs both early returns below (`usable` empty, or its first member
+    // already at or beyond the floor) and the "reached the end of `usable` cleanly" case at
+    // the bottom of this function.
+    let equivocation_stop =
+        equivocation_floor.map(|floor| FrontierStop::Equivocation { at_tree_size: floor });
+
     let Some(first) = usable.first() else {
-        return Ok(GapFreeResult { frontier: None, stop: None });
+        return Ok(GapFreeResult { frontier: None, stop: equivocation_stop });
     };
+
+    if let Some(floor) = equivocation_floor {
+        if first.tree_size >= floor {
+            return Ok(GapFreeResult { frontier: None, stop: equivocation_stop });
+        }
+    }
 
     let Some(first_governance) = resolve_governance_for(store, config, first.tree_size)? else {
         return Ok(GapFreeResult {
@@ -556,6 +597,11 @@ fn compute_gap_free_frontier(
     let mut prev = first;
     let mut prev_time = first_time;
     for cp in &usable[1..] {
+        if let Some(floor) = equivocation_floor {
+            if cp.tree_size >= floor {
+                return Ok(GapFreeResult { frontier: Some(frontier), stop: equivocation_stop });
+            }
+        }
         let cp_time = parse_checkpoint_time(&cp.checkpoint_time)?;
         if cp_time < prev_time {
             return Ok(GapFreeResult {
@@ -580,7 +626,7 @@ fn compute_gap_free_frontier(
         prev = cp;
         prev_time = cp_time;
     }
-    Ok(GapFreeResult { frontier: Some(frontier), stop: None })
+    Ok(GapFreeResult { frontier: Some(frontier), stop: equivocation_stop })
 }
 
 /// Whether the root recomputed from `leaves` matches `cp.root_hash`.
@@ -633,11 +679,18 @@ pub fn series_view(store: &Store, config: &Config) -> MirrorResult<SeriesView> {
         .filter(|m| m.state == CheckpointState::SeriesUsable)
         .map(|m| m.checkpoint.clone())
         .collect();
-    let GapFreeResult { frontier: gap_free_frontier, stop: frontier_stop } =
-        compute_gap_free_frontier(store, config, &usable_checkpoints)?;
     let root_divergences = find_root_divergences(&all);
+    let equivocation_floor = root_divergences.iter().min().copied();
+    let GapFreeResult { frontier: gap_free_frontier, stop: frontier_stop } =
+        compute_gap_free_frontier(store, config, &usable_checkpoints, equivocation_floor)?;
 
-    Ok(SeriesView { members, gap_free_frontier, frontier_stop, root_divergences })
+    Ok(SeriesView {
+        members,
+        gap_free_frontier,
+        frontier_stop,
+        root_divergences,
+        equivocation_floor,
+    })
 }
 
 /// `ITUB(index)`: the series-usable checkpoint with the smallest `tree_size > index`, but
@@ -1462,5 +1515,58 @@ mod tests {
             "e1 and e2, promoted earlier in the same failed transaction, must not persist"
         );
         assert_eq!(fx.store.all_checkpoints().expect("query"), checkpoints_before);
+    }
+
+    // ---- round 5 (commit 82b96c0): equivocation is a hard boundary, not a mere finding ----
+
+    #[test]
+    fn equivocation_leaves_members_below_the_floor_usable_and_refuses_at_and_beyond_it() {
+        // Core spec §7.3: "Equivocation ends the series ... From the lowest tree_size at
+        // which it occurs, the series is no longer canonical ... Members below the divergence
+        // remain usable."
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"8a".repeat(32)).expect("seed");
+        let fx = fixture(&log_key, "2026-01-01T00:00:00Z");
+        let genesis_leaf = log_leaf_hash(&fx.store.get_entries_range(0, 1).expect("range")[0]);
+        let root_1 = compute_root(&[genesis_leaf]);
+        let cp_1 = checkpoint_for(
+            &log_key,
+            &fx.config.log_id,
+            1,
+            root_1,
+            "2026-01-01T00:00:00.000000000Z",
+        );
+        ingest_checkpoint(&fx.store, &fx.config, &cp_1, None, &[]).expect("admits");
+
+        // Two authenticated checkpoints at tree_size 2 disagree on root_hash — equivocation,
+        // not a tie. Detected regardless of whether this mirror holds entries for tree_size 2
+        // at all (it does not, here): purely a metadata comparison.
+        let branch_a = checkpoint_for(
+            &log_key,
+            &fx.config.log_id,
+            2,
+            [0x01u8; 32],
+            "2026-01-01T00:01:00.000000000Z",
+        );
+        let branch_b = checkpoint_for(
+            &log_key,
+            &fx.config.log_id,
+            2,
+            [0x02u8; 32],
+            "2026-01-01T00:02:00.000000000Z",
+        );
+        ingest_checkpoint(&fx.store, &fx.config, &branch_a, None, &[]).expect("admits");
+        ingest_checkpoint(&fx.store, &fx.config, &branch_b, None, &[]).expect("admits");
+
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert_eq!(view.root_divergences, vec![2]);
+        assert_eq!(view.equivocation_floor, Some(2));
+        // Below the floor: the genesis-only checkpoint still grounds the gap-free frontier.
+        assert_eq!(view.gap_free_frontier, Some(1));
+        assert_eq!(view.frontier_stop, Some(FrontierStop::Equivocation { at_tree_size: 2 }));
+
+        // ITUB below the floor still answers...
+        assert_eq!(itub(&view, 0).map(|cp| cp.tree_size), Some(1));
+        // ...but refuses at or beyond it, rather than silently picking cp_2a or cp_2b.
+        assert!(itub(&view, 1).is_none());
     }
 }

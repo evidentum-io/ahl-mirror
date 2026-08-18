@@ -71,7 +71,8 @@ impl IntoResponse for ApiError {
                 StatusCode::NOT_FOUND
             }
             MirrorError::IncompleteEntries { .. }
-            | MirrorError::CheckpointNotSeriesUsable { .. } => StatusCode::CONFLICT,
+            | MirrorError::CheckpointNotSeriesUsable { .. }
+            | MirrorError::SeriesEquivocated { .. } => StatusCode::CONFLICT,
             MirrorError::StoredEntryCorrupt { .. }
             | MirrorError::CheckpointRootMismatch { .. }
             | MirrorError::IndexOverflow { .. }
@@ -258,14 +259,24 @@ struct RangeRequest {
 }
 
 /// Fetch the series-usable checkpoint at `tree_size`, or a specific error distinguishing
-/// "no such checkpoint at all" from "authenticated, but not (yet) series-usable" — core spec
-/// §7.3 permits only the latter to ground an enumeration response or completeness claim.
+/// "no such checkpoint at all", "authenticated, but not (yet) series-usable", and "the series
+/// equivocates at or below `tree_size`" — core spec §7.3 permits grounding an enumeration
+/// response or completeness claim only on a series-usable checkpoint strictly below the
+/// equivocation floor, if the series has one (see [`crate::checkpoint::SeriesView`]'s
+/// `equivocation_floor` docs). Checked first, and unconditionally on whether a checkpoint
+/// happens to exist at exactly `tree_size`: the whole region at or beyond the floor is
+/// off-limits, not merely the divergent members themselves.
 fn series_usable_checkpoint(
     store: &Store,
     config: &Config,
     tree_size: u64,
 ) -> Result<Checkpoint, MirrorError> {
     let view = crate::checkpoint::series_view(store, config)?;
+    if let Some(floor) = view.equivocation_floor {
+        if tree_size >= floor {
+            return Err(MirrorError::SeriesEquivocated { tree_size, floor });
+        }
+    }
     let mut candidates =
         view.members.into_iter().filter(|m| m.checkpoint.tree_size == tree_size).peekable();
     if candidates.peek().is_none() {
@@ -357,6 +368,16 @@ async fn get_checkpoint_handler(
     let config = Arc::clone(&state.config);
     let reported = blocking(move || {
         let view = crate::checkpoint::series_view(&store, &config)?;
+        // Picking the latest-`checkpoint_time` member by `max_by` below is exactly "choosing
+        // a branch" if `tree_size` sits at or beyond the equivocation floor (core spec §7.3):
+        // report the divergence instead of silently returning one of the conflicting members.
+        // `GET /v1/checkpoints` (no `tree_size`) still lists every authenticated member with
+        // its own state, divergence included — nothing is hidden there.
+        if let Some(floor) = view.equivocation_floor {
+            if tree_size >= floor {
+                return Err(MirrorError::SeriesEquivocated { tree_size, floor });
+            }
+        }
         view.members
             .into_iter()
             .filter(|m| m.checkpoint.tree_size == tree_size)
@@ -1013,6 +1034,83 @@ mod tests {
         let request = Request::get("/v1/itub/2").body(Body::empty()).expect("valid request");
         let response = app.oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A checkpoint signed for `tree_size`/`root`/`time` with no claim about what the root
+    /// actually commits — used to construct equivocating pairs (two checkpoints, one
+    /// `tree_size`, different `root_hash`).
+    fn signed_checkpoint_with_root(
+        harness: &TestHarness,
+        tree_size: u64,
+        root: Hash,
+        time: &str,
+    ) -> Checkpoint {
+        let mut cp = Checkpoint {
+            log_id: harness.log_id.clone(),
+            tree_size,
+            root_hash: format!("sha256:{}", hex::encode(root)),
+            checkpoint_time: time.to_owned(),
+            key_id: harness.log_key.key_id(),
+            signature: String::new(),
+        };
+        let blob = crate::checkpoint::checkpoint_blob(&cp).expect("well-formed");
+        cp.signature = harness.log_key.sign(&blob);
+        cp
+    }
+
+    #[tokio::test]
+    async fn equivocation_refuses_at_and_beyond_the_floor_but_not_below_it() {
+        // Core spec §7.3: "Equivocation ends the series ... a party serving series-dependent
+        // material MUST report the divergence rather than choosing a branch." Exercised over
+        // every HTTP path the coordinator named, plus the single-checkpoint lookup, which
+        // exhibits the same "pick a branch" pattern via its `max_by(checkpoint_time)`.
+        let hx = harness(); // cadence: 5 minutes
+        let app = router(hx.state.clone());
+
+        // A genuine checkpoint over the genesis manifest alone: tree_size 1, stays usable.
+        let (cp1, pending1) =
+            signed_checkpoint_for(&hx, &[], "2026-01-01T00:00:00.000000000Z", true);
+        assert_eq!(submit_checkpoint(&app, &cp1, &pending1).await, StatusCode::CREATED);
+
+        // Two checkpoints at tree_size 2 disagree on root_hash: equivocation.
+        let branch_a =
+            signed_checkpoint_with_root(&hx, 2, [0x01u8; 32], "2026-01-01T00:01:00.000000000Z");
+        let branch_b =
+            signed_checkpoint_with_root(&hx, 2, [0x02u8; 32], "2026-01-01T00:02:00.000000000Z");
+        assert_eq!(submit_checkpoint(&app, &branch_a, &[]).await, StatusCode::CREATED);
+        assert_eq!(submit_checkpoint(&app, &branch_b, &[]).await, StatusCode::CREATED);
+
+        // Below the floor: single-checkpoint lookup still answers.
+        let request = Request::get("/v1/checkpoints/1").body(Body::empty()).expect("valid request");
+        let response = app.clone().oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // At the floor: refused outright, never one of the two conflicting branches.
+        let request = Request::get("/v1/checkpoints/2").body(Body::empty()).expect("valid request");
+        let response = app.clone().oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // ITUB below the floor still answers; at or beyond it, refuses.
+        let request = Request::get("/v1/itub/0").body(Body::empty()).expect("valid request");
+        let response = app.clone().oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = Request::get("/v1/itub/1").body(Body::empty()).expect("valid request");
+        let response = app.clone().oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Range enumeration at the floor is refused, not silently answered from one branch.
+        let range_body = json!({ "tree_size": 2, "from_index": 0, "to_index": 1 });
+        let request = Request::post("/v1/range")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&range_body).expect("serialize")))
+            .expect("valid request");
+        let response = app.clone().oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // The consistency endpoint at the floor is refused the same way.
+        let request = Request::get("/v1/consistency?from=1&to=2").body(Body::empty()).expect("req");
+        let response = app.oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

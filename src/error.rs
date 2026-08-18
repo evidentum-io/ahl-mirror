@@ -138,6 +138,23 @@ pub enum MirrorError {
         tree_size: u64,
     },
 
+    /// `tree_size` is at or beyond the series' equivocation floor: two authenticated members
+    /// share some `tree_size <= this one` with different `root_hash` values, which core spec
+    /// §7.3 calls equivocation, not a tie. From the floor onward the series is no longer
+    /// canonical, so nothing may be grounded here — never served by silently picking a branch
+    /// (core spec §7.3: "Detecting equivocation and then continuing to serve one branch is a
+    /// conformance violation").
+    #[error(
+        "tree_size {tree_size} cannot ground a completeness claim: the series equivocates at \
+         tree_size {floor}"
+    )]
+    SeriesEquivocated {
+        /// The `tree_size` a caller asked to ground something at.
+        tree_size: u64,
+        /// The lowest `tree_size` at which two authenticated members diverge in `root_hash`.
+        floor: u64,
+    },
+
     /// Fewer entries are stored than the checkpoint commits; a range proof under it cannot
     /// be built until the gap is filled (adaptor profile §10.3, §10.4).
     #[error("checkpoint commits {need} entries but only {have} are stored")]
@@ -225,6 +242,29 @@ pub enum MirrorError {
         value: String,
         /// Which prohibited component was found (`'Y'` or `'M'`).
         component: char,
+    },
+
+    /// A duration's fractional-seconds component carries more than nine digits — core spec
+    /// §7.3 allows "at most nine digits"; a value with more is malformed and MUST be
+    /// rejected, never truncated or rounded, since either would make the parsed value
+    /// implementation-dependent in exactly the way the calendar-component restriction above
+    /// exists to prevent (a different conformant parser could reject, round, or truncate the
+    /// same input to a different nanosecond total).
+    #[error("`{value}` carries more than nine fractional-second digits")]
+    DurationFractionTooLong {
+        /// The value as submitted.
+        value: String,
+    },
+
+    /// `checkpoint_cadence` parses to zero nanoseconds — core spec §7.3 requires it to be
+    /// greater than zero: a zero-length cadence is not a maximum-gap obligation at all, and
+    /// would make every interval trivially "exceeded" or trivially satisfied depending on
+    /// implementation, exactly the kind of implementation-dependence the duration rules exist
+    /// to foreclose.
+    #[error("`{value}` is not a valid checkpoint_cadence: it MUST be greater than zero")]
+    NonPositiveCadence {
+        /// The value as submitted.
+        value: String,
     },
 
     /// A `cadence_epoch` value is not a valid RFC 3339 timestamp (core spec §7.3 schema).

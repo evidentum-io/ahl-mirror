@@ -152,10 +152,13 @@ not needed.
   which of those are additionally **series-usable** — root recomputed against held entries,
   and RFC 9162 consistency verified against the nearest earlier series-usable member (and
   against a later one, once it exists, via *that* member's own check — the relationship is
-  symmetric, so it is only ever computed once). Only series-usable checkpoints are eligible
-  for range enumeration (`CheckpointNotSeriesUsable` otherwise), a `GET /v1/consistency`
-  endpoint, or `ITUB`; an authenticated-but-not-series-usable checkpoint is retained and
-  reported as such (`GET /v1/checkpoints` shows every authenticated member's state).
+  symmetric, so it is only ever computed once). Only series-usable checkpoints strictly below
+  the equivocation floor (see below), if the series has one, are eligible for range
+  enumeration (`CheckpointNotSeriesUsable`, or `SeriesEquivocated` at or beyond the floor,
+  otherwise), a `GET /v1/consistency` endpoint, `GET /v1/checkpoints/{tree_size}`, or `ITUB`;
+  an authenticated-but-not-series-usable checkpoint is retained and reported as such
+  (`GET /v1/checkpoints`, with no `tree_size`, shows every authenticated member's state and
+  never refuses — nothing is hidden there even at or beyond the floor).
 - **A gap-free-frontier computation that matches core spec §7.3's corrected rules.** The
   series has exactly one start, `cadence_epoch`; the genesis checkpoint (`tree_size ==
   genesis_entry_index + 1`) plays no anchoring role — it need not even be published. Instead,
@@ -175,6 +178,18 @@ not needed.
   mirror happens to hold. `ITUB` returns a value only for a series-usable member within the
   resulting frontier, and where a `tree_size` carries several series-usable members, the one
   with the **earliest** `checkpoint_time` governs.
+- **Equivocation is a hard boundary, not a mere finding (core spec §7.3: "Equivocation ends
+  the series").** Two authenticated members sharing a `tree_size` with differing `root_hash`
+  values are equivocation, not a tie; `SeriesView::equivocation_floor` is the lowest such
+  `tree_size`, if any. From it onward the series is no longer canonical: `gap_free_frontier`
+  never reaches or passes it (`FrontierStop::Equivocation`, permanently — no later arrival of
+  entries or checkpoints can un-equivocate a log that already published two conflicting
+  roots), so `ITUB` refuses there automatically. Range enumeration, the consistency endpoint,
+  and the single-checkpoint lookup independently refuse the same region
+  (`MirrorError::SeriesEquivocated`, HTTP 409) even for a `tree_size` whose own root happens
+  to recompute correctly against entries this mirror holds — a checkpoint agreeing with this
+  mirror's local copy does not un-equivocate a log that published a conflicting root
+  elsewhere. Members strictly below the floor are unaffected.
 - **Retrieval by entry id** (adaptor profile §10.1.1, unchanged in shape): present returns the
   stored bytes unaltered (raw `application/json`, or a `base64:` text form via
   `?encoding=base64`), absent is a 404 with an explicit note that absence is a fact about the
@@ -188,10 +203,11 @@ not needed.
 ## Where the profile was ambiguous or under-specified
 
 Reported as asked, for the next specification round — not papered over. Points closed by the
-now-published core spec §7.3 are marked as such, most recently by commit `9962750` ("fix
-series start, ties and comparison"), which closed items 4 and 5 below outright and corrected
-this crate's own prior guess on item 4 in the process; the rest are new, surfaced by this
-round's fixes.
+now-published core spec §7.3 are marked as such: commit `9962750` ("fix series start, ties
+and comparison") closed items 4 and 5 below outright and corrected this crate's own prior
+guess on item 4 in the process; commit `82b96c0` ("equivocation boundary and fraction rule")
+closed item 9's open question about the root-divergence check's scope, confirming this
+crate's own choice.
 
 1. **Resolved by core spec §7.3, no residual choice left**: the manifest `log` object's schema
    (field names, that `checkpoint_cadence`/`witness_grace_period` are ISO 8601 durations
@@ -246,19 +262,38 @@ round's fixes.
    *retiring* `key` statement's target key was itself ever validly added, since a key that
    was never added cannot resolve a signature in the first place, making the check redundant
    in practice but not stated as guaranteed by the specification text. Noted for completeness.
-9. **Which checkpoints ground the corpus-validity window check and the root-divergence
-   finding is not stated explicitly.** §7.3 says "the earliest checkpoint committing the
-   genesis manifest" for the window, and "members" for the root-tie rule, without saying
-   whether a merely-*authenticated* (not yet series-usable) checkpoint counts. This crate
-   scopes the window check to the series-usable subset only — `compute_gap_free_frontier`
-   takes `usable: &[Checkpoint]`, so an unverified checkpoint's claimed `checkpoint_time`
-   never gates whether the range is judged to start at all, consistent with §7.3 restricting
-   series-usable status as the only state that may ground a completeness claim — but scopes
-   the root-divergence finding (`SeriesView::root_divergences`) to *every* authenticated
-   member, deliberately wider, since detecting two checkpoints that structurally cannot both
-   be right is possible from checkpoint metadata alone, before either is proven series-usable
-   or entries even exist to check them against. Both readings seem defensible; flagged in
-   case the intended scope is uniform across the two checks.
+9. **Resolved by core spec §7.3 (commit `82b96c0`), confirming this crate's own choice.**
+   Previously flagged: whether the corpus-validity window check and the root-divergence
+   finding are scoped to series-usable checkpoints only or to every authenticated one, since
+   §7.3 said "the earliest checkpoint committing the genesis manifest" for the window and
+   "members" for the root-tie rule without saying which. The equivocation paragraph now
+   states the root-tie rule over "two *authenticated* members" explicitly, matching this
+   crate's wider scope for `SeriesView::root_divergences` (and now `equivocation_floor`) —
+   computed from every authenticated checkpoint, detectable from metadata alone before either
+   member is proven series-usable or entries even exist to check them against. The window
+   check remains correctly scoped to series-usable members only (`compute_gap_free_frontier`
+   still takes `usable: &[Checkpoint]`): an unverified checkpoint's claimed `checkpoint_time`
+   must not gate whether a range is judged to start at all.
+10. **Equivocation is now a hard boundary (core spec §7.3, commit `82b96c0`).** Two
+    authenticated members sharing a `tree_size` with differing `root_hash` are equivocation:
+    "no incorporation bound, enumeration response or completeness claim may be grounded at or
+    beyond that point ... a party serving series-dependent material MUST report the
+    divergence rather than choosing a branch." `SeriesView::equivocation_floor` and
+    `FrontierStop::Equivocation` implement the boundary in `itub` (via `gap_free_frontier`,
+    which never reaches or passes the floor), range enumeration and the consistency endpoint
+    (both via `series_usable_checkpoint`, which refuses `tree_size >= floor` before ever
+    inspecting which specific checkpoint sits there), and additionally the single-checkpoint
+    lookup (`GET /v1/checkpoints/{tree_size}`), whose `max_by(checkpoint_time)` tie-break was
+    exactly the "pick a branch" pattern the rule prohibits — extended beyond the three paths
+    named for this fix since it exhibited the identical defect. `GET /v1/checkpoints` (no
+    `tree_size`) is deliberately left unguarded: it already reports every authenticated
+    member with its own state, divergence included, hiding nothing. One implementer's choice
+    remains: when the `usable` list is exhausted before ever reaching the equivocation floor
+    (e.g. floor is far beyond any currently-published checkpoint), this crate still reports
+    `FrontierStop::Equivocation` rather than `None`, on the reasoning that a known, permanent
+    equivocation is more informative than reporting a "clean, just needs more data" stop that
+    a caller might reasonably retry expecting to eventually succeed. §7.3 does not state
+    which stop reason should be reported in that specific case.
 
 ## Quick start
 

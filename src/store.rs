@@ -64,12 +64,14 @@ CREATE TABLE IF NOT EXISTS entries (
     envelope    BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
-    tree_size       INTEGER PRIMARY KEY,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tree_size       INTEGER NOT NULL,
     log_id          TEXT NOT NULL,
     root_hash       TEXT NOT NULL,
     checkpoint_time TEXT NOT NULL,
     key_id          TEXT NOT NULL,
-    signature       TEXT NOT NULL
+    signature       TEXT NOT NULL,
+    UNIQUE(tree_size, checkpoint_time)
 );
 ";
 
@@ -90,15 +92,6 @@ pub struct StoredEntry {
     pub entry_index: u64,
     /// The exact bytes anchored as this entry (`JCS(envelope)`).
     pub envelope: Vec<u8>,
-}
-
-/// The checkpoint series members immediately below and above some `tree_size`.
-#[derive(Debug, Clone, Default)]
-pub struct Neighbours {
-    /// The nearest series member with a smaller `tree_size`, if any.
-    pub predecessor: Option<Checkpoint>,
-    /// The nearest series member with a larger `tree_size`, if any.
-    pub successor: Option<Checkpoint>,
 }
 
 /// The mirror's durable store.
@@ -358,17 +351,21 @@ impl Store {
     // Checkpoints
     // -----------------------------------------------------------------------------------
 
-    /// Insert a checkpoint into the canonical series.
+    /// Record an *authenticated* checkpoint (adaptor profile §6.5; core spec §7.3) — a
+    /// signature-verified claim, not yet necessarily series-usable.
     ///
-    /// This performs no verification of its own — callers (see
-    /// [`crate::checkpoint::ingest_checkpoint`]) MUST validate the checkpoint's signature and
-    /// consistency with its series neighbours first. Series members may be admitted in any
-    /// `tree_size` order, so a gap can be backfilled later — completeness is tracked
-    /// separately (see [`crate::checkpoint::gap_free_frontier`]), not enforced as
-    /// "monotonic" by this table. A `tree_size` already in the series is accepted
-    /// idempotently if the content is byte-identical, and rejected otherwise: adaptor
-    /// profile §5.2.2 item 4 requires the series to be append-only in publication — a
-    /// published member is never withdrawn or replaced.
+    /// This performs no signature or consistency verification of its own — callers (see
+    /// [`crate::checkpoint::ingest_checkpoint`]) MUST authenticate first. Series members may
+    /// be admitted in any `tree_size` order, so a gap can be backfilled later; whether the
+    /// series is provably gap-free, and which members are *series-usable*, is computed on
+    /// demand from the full set (see [`crate::checkpoint::series_view`]), never stored as a
+    /// static flag here, so it always reflects the store's current state (entries can arrive
+    /// after a checkpoint does). A `(tree_size, checkpoint_time)` pair already present is
+    /// accepted idempotently if the content is byte-identical, and rejected otherwise —
+    /// adaptor profile §5.2.2 item 4 requires the series to be append-only in publication.
+    /// The *same* `tree_size` at a *different* `checkpoint_time` is not a conflict: core spec
+    /// §7.3 requires a quiet log to keep publishing checkpoints at unchanged `tree_size`, so
+    /// repeated sizes are legitimate, distinct members.
     ///
     /// # Errors
     ///
@@ -378,15 +375,18 @@ impl Store {
         self.with_conn(|conn| {
             let existing = row_to_checkpoint(conn.query_row(
                 "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
-                 FROM checkpoints WHERE tree_size = ?1",
-                [tree_size_i64],
+                 FROM checkpoints WHERE tree_size = ?1 AND checkpoint_time = ?2",
+                params![tree_size_i64, cp.checkpoint_time],
                 checkpoint_row,
             ))?;
             if let Some(existing) = existing {
                 if &existing == cp {
                     return Ok(InsertOutcome::AlreadyPresent);
                 }
-                return Err(MirrorError::SeriesMemberConflict { tree_size: cp.tree_size });
+                return Err(MirrorError::SeriesMemberConflict {
+                    tree_size: cp.tree_size,
+                    checkpoint_time: cp.checkpoint_time.clone(),
+                });
             }
             conn.execute(
                 "INSERT INTO checkpoints (tree_size, log_id, root_hash, checkpoint_time, \
@@ -404,24 +404,12 @@ impl Store {
         })
     }
 
-    /// Fetch the checkpoint series member with the greatest `tree_size`, i.e. the latest
-    /// published checkpoint.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MirrorError::Store`] on a database failure.
-    pub fn latest_checkpoint(&self) -> MirrorResult<Option<Checkpoint>> {
-        self.with_conn(|conn| {
-            row_to_checkpoint(conn.query_row(
-                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
-                 FROM checkpoints ORDER BY tree_size DESC LIMIT 1",
-                [],
-                checkpoint_row,
-            ))
-        })
-    }
-
-    /// Fetch the checkpoint at exactly `tree_size`.
+    /// Fetch the most recently declared authenticated checkpoint at exactly `tree_size`
+    /// (largest `checkpoint_time`) — any one of them opens the same root, since root is a
+    /// pure function of `tree_size` for a genuine tree, so this is sufficient for range and
+    /// retrieval purposes. Callers needing series-usability (adaptor profile enumeration,
+    /// `ITUB`) MUST check it via [`crate::checkpoint::series_view`], never assume it from
+    /// mere presence here.
     ///
     /// # Errors
     ///
@@ -431,70 +419,27 @@ impl Store {
         self.with_conn(|conn| {
             row_to_checkpoint(conn.query_row(
                 "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
-                 FROM checkpoints WHERE tree_size = ?1",
+                 FROM checkpoints WHERE tree_size = ?1 ORDER BY checkpoint_time DESC LIMIT 1",
                 [tree_size_i64],
                 checkpoint_row,
             ))
         })
     }
 
-    /// Fetch the checkpoint series members immediately below and above `tree_size` — the
-    /// predecessor and successor a new member at `tree_size` must be consistency-checked
-    /// against (adaptor profile §5.2.2 item 1).
+    /// Every authenticated checkpoint, ordered ascending by `(tree_size, checkpoint_time)` —
+    /// the raw material [`crate::checkpoint::series_view`] computes series-usability and
+    /// gap-freeness from. Includes checkpoints that are not (or not yet) series-usable; see
+    /// core spec §7.3: an authenticated checkpoint that is not series-usable MAY be retained
+    /// and MUST be reported as such.
     ///
     /// # Errors
     ///
     /// Returns [`MirrorError::Store`] on a database failure.
-    pub fn neighbours(&self, tree_size: u64) -> MirrorResult<Neighbours> {
-        let tree_size_i64 = to_i64("tree_size", tree_size)?;
-        self.with_conn(|conn| {
-            let predecessor = row_to_checkpoint(conn.query_row(
-                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
-                 FROM checkpoints WHERE tree_size < ?1 ORDER BY tree_size DESC LIMIT 1",
-                [tree_size_i64],
-                checkpoint_row,
-            ))?;
-            let successor = row_to_checkpoint(conn.query_row(
-                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
-                 FROM checkpoints WHERE tree_size > ?1 ORDER BY tree_size ASC LIMIT 1",
-                [tree_size_i64],
-                checkpoint_row,
-            ))?;
-            Ok(Neighbours { predecessor, successor })
-        })
-    }
-
-    /// Fetch the checkpoint series member with the smallest `tree_size` strictly greater than
-    /// `index`. Raw material for `ITUB(index)` (adaptor profile §5.2.1) — see
-    /// [`crate::checkpoint::itub`] for the gap-free-aware version callers MUST use instead of
-    /// this alone.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MirrorError::Store`] on a database failure.
-    pub fn itub_checkpoint(&self, index: u64) -> MirrorResult<Option<Checkpoint>> {
-        let index_i64 = to_i64("index", index)?;
-        self.with_conn(|conn| {
-            row_to_checkpoint(conn.query_row(
-                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
-                 FROM checkpoints WHERE tree_size > ?1 ORDER BY tree_size ASC LIMIT 1",
-                [index_i64],
-                checkpoint_row,
-            ))
-        })
-    }
-
-    /// The full canonical checkpoint series, ascending by `tree_size` (adaptor profile
-    /// §5.2.2).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MirrorError::Store`] on a database failure.
-    pub fn checkpoint_series(&self) -> MirrorResult<Vec<Checkpoint>> {
+    pub fn all_checkpoints(&self) -> MirrorResult<Vec<Checkpoint>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
-                 FROM checkpoints ORDER BY tree_size ASC",
+                 FROM checkpoints ORDER BY tree_size ASC, checkpoint_time ASC",
             )?;
             let rows = stmt.query_map([], checkpoint_row)?;
             rows.collect::<Result<Vec<Checkpoint>, _>>().map_err(MirrorError::from)
@@ -659,23 +604,28 @@ mod tests {
         store.insert_checkpoint(&checkpoint(5)).expect("first checkpoint, backfilled");
 
         assert_eq!(store.get_checkpoint(5).expect("query").expect("present").tree_size, 5);
-        assert_eq!(store.latest_checkpoint().expect("query").expect("present").tree_size, 10);
         assert_eq!(
             store
-                .checkpoint_series()
+                .all_checkpoints()
                 .expect("series")
                 .iter()
                 .map(|c| c.tree_size)
                 .collect::<Vec<_>>(),
             vec![5, 10]
         );
-        assert_eq!(store.itub_checkpoint(7).expect("query").expect("present").tree_size, 10);
-        assert_eq!(store.itub_checkpoint(3).expect("query").expect("present").tree_size, 5);
-        assert!(store.itub_checkpoint(10).expect("query").is_none());
+    }
 
-        let Neighbours { predecessor, successor } = store.neighbours(7).expect("query");
-        assert_eq!(predecessor.expect("present").tree_size, 5);
-        assert_eq!(successor.expect("present").tree_size, 10);
+    #[test]
+    fn a_quiet_log_may_republish_the_same_tree_size_at_a_later_time() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let mut idle = checkpoint(5);
+        idle.checkpoint_time = "2026-01-01T00:05:00.000000000Z".to_owned();
+        store.insert_checkpoint(&checkpoint(5)).expect("first publication");
+        store.insert_checkpoint(&idle).expect("idle republication at the same tree_size");
+
+        let series = store.all_checkpoints().expect("series");
+        assert_eq!(series.len(), 2);
+        assert!(series.iter().all(|cp| cp.tree_size == 5));
     }
 
     #[test]
@@ -690,7 +640,7 @@ mod tests {
         different.root_hash = format!("sha256:{}", "ff".repeat(32));
         assert!(matches!(
             store.insert_checkpoint(&different),
-            Err(MirrorError::SeriesMemberConflict { tree_size: 10 })
+            Err(MirrorError::SeriesMemberConflict { tree_size: 10, .. })
         ));
     }
 }

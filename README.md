@@ -246,6 +246,19 @@ round's fixes.
    *retiring* `key` statement's target key was itself ever validly added, since a key that
    was never added cannot resolve a signature in the first place, making the check redundant
    in practice but not stated as guaranteed by the specification text. Noted for completeness.
+9. **Which checkpoints ground the corpus-validity window check and the root-divergence
+   finding is not stated explicitly.** §7.3 says "the earliest checkpoint committing the
+   genesis manifest" for the window, and "members" for the root-tie rule, without saying
+   whether a merely-*authenticated* (not yet series-usable) checkpoint counts. This crate
+   scopes the window check to the series-usable subset only — `compute_gap_free_frontier`
+   takes `usable: &[Checkpoint]`, so an unverified checkpoint's claimed `checkpoint_time`
+   never gates whether the range is judged to start at all, consistent with §7.3 restricting
+   series-usable status as the only state that may ground a completeness claim — but scopes
+   the root-divergence finding (`SeriesView::root_divergences`) to *every* authenticated
+   member, deliberately wider, since detecting two checkpoints that structurally cannot both
+   be right is possible from checkpoint metadata alone, before either is proven series-usable
+   or entries even exist to check them against. Both readings seem defensible; flagged in
+   case the intended scope is uniform across the two checks.
 
 ## Quick start
 

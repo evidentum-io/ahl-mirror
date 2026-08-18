@@ -15,24 +15,28 @@
 //! An entry becomes retrievable/enumerable only once it carries cryptographic evidence of
 //! anchoring — a Merkle inclusion proof against a checkpoint this mirror has itself
 //! authenticated — never on the strength of a submitted claim alone (see [`ingest`],
-//! [`store`]). Checkpoint-signing keys are resolved the way the profile resolves them: from
-//! the `manifest` entries this mirror already holds canonically, bootstrapped from a
-//! configured genesis anchor (see [`manifest`]), honouring per-key activation bounds. The
-//! checkpoint series tracks whether it is provably gap-free at a declared cadence, and
-//! `ITUB` reports unavailable rather than a guess wherever it is not (see [`checkpoint`]).
+//! [`store`]). Checkpoint-signing keys are resolved from a **verified** governance chain: a
+//! `manifest`/`key` statement counts only if its producer signature verifies and, for a
+//! non-genesis manifest, its `predecessor` links to the version active immediately before it
+//! — walked from a configured genesis anchor, never trusted merely because it is anchored
+//! (core spec §7.3; see [`manifest`]). A checkpoint is **authenticated** once its log
+//! signature verifies under that resolved key set, and **series-usable** — eligible to ground
+//! an incorporation-time bound, an enumeration response, or a completeness claim — only once
+//! its root recomputes against held entries and its consistency relationships with its series
+//! neighbours verify (core spec §7.3; see [`checkpoint`]). The checkpoint series tracks
+//! whether it is provably gap-free at the cadence the governing manifest declares, and `ITUB`
+//! reports unavailable rather than a guess wherever it is not.
 //!
 //! # What this crate is not
 //!
-//! It does not walk the statement graph (inputs, outputs, triggers, closure), does not
-//! verify producer signatures, and does not validate manifest-chain linkage
-//! (`predecessor` pointers, signature-based chain-of-trust) — those are a verifier's job
-//! (core spec §6). The one narrow exception is [`manifest`]: it reads the `type` and `log`
-//! fields of `manifest`-typed *canonical* entries, for the sole purpose of resolving
-//! checkpoint-signing keys and cadence the way adaptor profile §7.3 requires, trusting a
-//! manifest entry's content purely because of *where* it sits (core spec §2.3.5), not
-//! because its own signature or lineage was checked. See the crate's `README.md` ("Scope and
-//! honest gaps") for the specific places the profile assumes more context than a standalone
-//! mirror has, and how this crate resolves that.
+//! It does not walk the statement graph (inputs, outputs, triggers, closure) and does not
+//! interpret dataset, pipeline, or retention semantics — those are a verifier's job (core
+//! spec §6). The one exception is [`manifest`]: it verifies the governance chain itself
+//! (producer signatures, `predecessor` linkage) because core spec §7.3 makes that
+//! verification a prerequisite for resolving a checkpoint-signing key at all, not an optional
+//! extra a mirror can skip. See the crate's `README.md` ("Scope and honest gaps") for the
+//! specific places the profile assumes more context than a standalone mirror has, and how
+//! this crate resolves that.
 //!
 //! # Reuse, not reimplementation
 //!
@@ -68,6 +72,7 @@
 
 pub mod checkpoint;
 pub mod config;
+pub mod duration;
 pub mod error;
 pub mod http;
 pub mod ingest;
@@ -77,6 +82,6 @@ pub mod range;
 pub mod retrieval;
 pub mod store;
 
-pub use config::{Config, ConfigSpec, TrustedLogKey, TrustedLogKeySpec};
+pub use config::{Config, ConfigSpec, KeyObjectSpec, ResolvedKeyObject};
 pub use error::{MirrorError, MirrorResult};
 pub use store::Store;

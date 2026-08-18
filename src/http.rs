@@ -19,7 +19,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::checkpoint::{Checkpoint, PendingPromotion};
+use crate::checkpoint::{Checkpoint, PendingPromotion, ReportedCheckpoint};
 use crate::config::Config;
 use crate::error::MirrorError;
 use crate::range::RangeResponse;
@@ -30,7 +30,7 @@ use crate::store::{InsertOutcome, Store};
 pub struct AppState {
     /// The durable store.
     pub store: Arc<Store>,
-    /// The mirror's configuration and trusted keys.
+    /// The mirror's configuration and genesis governance anchor.
     pub config: Arc<Config>,
 }
 
@@ -70,7 +70,8 @@ impl IntoResponse for ApiError {
             MirrorError::UnknownCheckpoint { .. } | MirrorError::NotStaged { .. } => {
                 StatusCode::NOT_FOUND
             }
-            MirrorError::IncompleteEntries { .. } => StatusCode::CONFLICT,
+            MirrorError::IncompleteEntries { .. }
+            | MirrorError::CheckpointNotSeriesUsable { .. } => StatusCode::CONFLICT,
             MirrorError::StoredEntryCorrupt { .. }
             | MirrorError::CheckpointRootMismatch { .. }
             | MirrorError::IndexOverflow { .. }
@@ -157,7 +158,8 @@ async fn stage_handler(
 #[derive(Debug, Deserialize)]
 struct PromoteRequest {
     entry_id: String,
-    /// The already-canonical checkpoint the inclusion proof is checked against.
+    /// The `tree_size` of an already-authenticated checkpoint the inclusion proof is checked
+    /// against (the most recently declared one at that size, if more than one exists).
     tree_size: u64,
     leaf_index: u64,
     inclusion_path: Vec<String>,
@@ -255,17 +257,37 @@ struct RangeRequest {
     to_index: u64,
 }
 
+/// Fetch the series-usable checkpoint at `tree_size`, or a specific error distinguishing
+/// "no such checkpoint at all" from "authenticated, but not (yet) series-usable" — core spec
+/// §7.3 permits only the latter to ground an enumeration response or completeness claim.
+fn series_usable_checkpoint(
+    store: &Store,
+    config: &Config,
+    tree_size: u64,
+) -> Result<Checkpoint, MirrorError> {
+    let view = crate::checkpoint::series_view(store, config)?;
+    let mut candidates =
+        view.members.into_iter().filter(|m| m.checkpoint.tree_size == tree_size).peekable();
+    if candidates.peek().is_none() {
+        return Err(MirrorError::UnknownCheckpoint { tree_size });
+    }
+    candidates
+        .find(|m| m.state == crate::checkpoint::CheckpointState::SeriesUsable)
+        .map(|m| m.checkpoint)
+        .ok_or(MirrorError::CheckpointNotSeriesUsable { tree_size })
+}
+
 async fn range_handler(
     State(state): State<AppState>,
     Json(req): Json<RangeRequest>,
 ) -> Result<Json<RangeResponse>, ApiError> {
     let store = Arc::clone(&state.store);
+    let config = Arc::clone(&state.config);
     let checkpoint = blocking({
         let store = Arc::clone(&store);
-        move || store.get_checkpoint(req.tree_size)
+        move || series_usable_checkpoint(&store, &config, req.tree_size)
     })
-    .await?
-    .ok_or(MirrorError::UnknownCheckpoint { tree_size: req.tree_size })?;
+    .await?;
 
     let response = blocking(move || {
         let all_entries = store.get_entries_range(0, checkpoint.tree_size)?;
@@ -277,7 +299,7 @@ async fn range_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Checkpoints and ITUB (adaptor profile §5.2, §6, §7.3)
+// Checkpoints and ITUB (adaptor profile §5.2, §6; core spec §7.3)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -286,7 +308,9 @@ struct CheckpointIngestRequest {
     /// `"base64:" || base64(the 98-byte blob)` (adaptor profile §6.4), optional.
     raw: Option<String>,
     /// Staged entries to promote atomically alongside this checkpoint, each with a Merkle
-    /// inclusion proof against it (adaptor profile §8.2).
+    /// inclusion proof against it (adaptor profile §8.2). MAY include governance material
+    /// (e.g. a manifest rotation) this very checkpoint depends on to resolve its own signing
+    /// key (core spec §7.3).
     #[serde(default)]
     entries_to_promote: Vec<PendingPromotion>,
 }
@@ -318,55 +342,49 @@ async fn checkpoint_ingest_handler(
 
 async fn list_checkpoints_handler(
     State(state): State<AppState>,
-) -> Result<Json<Vec<Checkpoint>>, ApiError> {
+) -> Result<Json<Vec<ReportedCheckpoint>>, ApiError> {
     let store = Arc::clone(&state.store);
-    let series = blocking(move || store.checkpoint_series()).await?;
-    Ok(Json(series))
+    let config = Arc::clone(&state.config);
+    let view = blocking(move || crate::checkpoint::series_view(&store, &config)).await?;
+    Ok(Json(view.members))
 }
 
 async fn get_checkpoint_handler(
     State(state): State<AppState>,
     Path(tree_size): Path<u64>,
-) -> Result<Json<Checkpoint>, ApiError> {
-    let store = Arc::clone(&state.store);
-    let checkpoint = blocking(move || store.get_checkpoint(tree_size))
-        .await?
-        .ok_or(MirrorError::UnknownCheckpoint { tree_size })?;
-    Ok(Json(checkpoint))
-}
-
-/// Resolve the series and the cadence declared for its latest member, in one blocking call.
-async fn series_with_cadence(state: &AppState) -> Result<(Vec<Checkpoint>, Option<u64>), ApiError> {
+) -> Result<Json<ReportedCheckpoint>, ApiError> {
     let store = Arc::clone(&state.store);
     let config = Arc::clone(&state.config);
-    blocking(move || {
-        let series = store.checkpoint_series()?;
-        let cadence = match series.last() {
-            Some(latest) => {
-                crate::manifest::resolve(&store, &config, latest.tree_size)?.cadence_seconds()
-            }
-            None => None,
-        };
-        Ok((series, cadence))
+    let reported = blocking(move || {
+        let view = crate::checkpoint::series_view(&store, &config)?;
+        view.members
+            .into_iter()
+            .filter(|m| m.checkpoint.tree_size == tree_size)
+            .max_by(|a, b| a.checkpoint.checkpoint_time.cmp(&b.checkpoint.checkpoint_time))
+            .ok_or(MirrorError::UnknownCheckpoint { tree_size })
     })
-    .await
+    .await?;
+    Ok(Json(reported))
 }
 
 async fn itub_handler(
     State(state): State<AppState>,
     Path(index): Path<u64>,
 ) -> Result<Response, ApiError> {
-    let (series, cadence) = series_with_cadence(&state).await?;
-    let found = crate::checkpoint::itub(&series, index, cadence)?.cloned();
+    let store = Arc::clone(&state.store);
+    let config = Arc::clone(&state.config);
+    let view = blocking(move || crate::checkpoint::series_view(&store, &config)).await?;
+    let found = crate::checkpoint::itub(&view, index).cloned();
     Ok(found.map_or_else(
         || {
             (
                 StatusCode::NOT_FOUND,
                 Json(json!({
                     "index": index,
-                    "note": "ITUB is undefined: no series member yet covers this index, or \
-                             the series is not proven gap-free that far (adaptor profile \
-                             §5.2.1-§5.2.2)",
+                    "note": "ITUB is undefined: no series-usable member yet covers this \
+                             index, or the series is not proven gap-free that far (core spec \
+                             §7.3; adaptor profile §5.2.1)",
+                    "frontier_stop": view.frontier_stop,
                 })),
             )
                 .into_response()
@@ -393,15 +411,12 @@ async fn consistency_handler(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let store = Arc::clone(&state.store);
+    let config = Arc::clone(&state.config);
     let (from_cp, to_cp) = blocking({
         let store = Arc::clone(&store);
         move || {
-            let from_cp = store
-                .get_checkpoint(query.from)?
-                .ok_or(MirrorError::UnknownCheckpoint { tree_size: query.from })?;
-            let to_cp = store
-                .get_checkpoint(query.to)?
-                .ok_or(MirrorError::UnknownCheckpoint { tree_size: query.to })?;
+            let from_cp = series_usable_checkpoint(&store, &config, query.from)?;
+            let to_cp = series_usable_checkpoint(&store, &config, query.to)?;
             Ok((from_cp, to_cp))
         }
     })
@@ -450,26 +465,81 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::config::{ConfigSpec, TrustedLogKeySpec};
+    use crate::config::{ConfigSpec, KeyObjectSpec};
     use crate::metadata::{adaptor_metadata_object, log_leaf_hash};
 
-    fn test_state() -> (AppState, ahl_core::TestKey, String) {
-        let key = ahl_core::TestKey::from_seed_hex("log-1", &"42".repeat(32)).expect("seed");
+    /// A fresh store with a verified genesis manifest already canonical at index 0 (5-minute
+    /// cadence from `epoch`), plus everything needed to build and admit further checkpoints.
+    struct TestHarness {
+        state: AppState,
+        log_key: ahl_core::TestKey,
+        log_id: String,
+        genesis_leaf: Hash,
+    }
+
+    fn entry_id_of(bytes: &[u8]) -> String {
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
+    fn genesis_manifest_bytes(
+        log_id: &str,
+        producer: &ahl_core::TestKey,
+        log_key: &ahl_core::TestKey,
+        epoch: &str,
+    ) -> Vec<u8> {
+        let payload = json!({
+            "type": "manifest",
+            "producer": "producer-1",
+            "keys": [
+                { "key_id": producer.key_id(), "pubkey": producer.pubkey(), "valid_from_index": 0 }
+            ],
+            "log": {
+                "log_id": log_id,
+                "operator": "op-1",
+                "adaptor": { "id": "ahl-adaptor-atl-v1", "hash": "sha256:00" },
+                "checkpoint_cadence": "PT5M",
+                "cadence_epoch": epoch,
+                "witness_grace_period": "PT10M",
+                "keys": [
+                    { "key_id": log_key.key_id(), "pubkey": log_key.pubkey(), "valid_from_index": 0 }
+                ],
+            },
+        });
+        ahl_core::jcs(&ahl_core::envelope(payload, producer))
+    }
+
+    fn harness() -> TestHarness {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"90".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log-1", &"42".repeat(32)).expect("seed");
         let log_id = format!("sha256:{}", "77".repeat(32));
+        let genesis_bytes =
+            genesis_manifest_bytes(&log_id, &producer, &log_key, "2026-01-01T00:00:00Z");
+        let genesis_id = entry_id_of(&genesis_bytes);
+        let genesis_leaf = log_leaf_hash(&genesis_bytes);
+
+        let store = Store::open_in_memory().expect("in-memory store");
+        store.stage_entry(&genesis_id, &genesis_bytes).expect("stage genesis");
+        store.promote_entry(0, &genesis_id).expect("promote genesis");
+
         let config = Config::resolve(&ConfigSpec {
             log_id: log_id.clone(),
-            keys: vec![TrustedLogKeySpec {
-                key_id: key.key_id(),
-                pubkey: key.pubkey(),
+            genesis_manifest_entry_id: genesis_id,
+            genesis_producer_keys: vec![KeyObjectSpec {
+                key_id: producer.key_id(),
+                pubkey: producer.pubkey(),
                 valid_from_index: 0,
             }],
-            genesis_manifest_entry_id: None,
-            genesis_checkpoint_cadence_seconds: Some(300),
             store_path: ":memory:".to_owned(),
         })
         .expect("valid config");
-        let store = Store::open_in_memory().expect("in-memory store");
-        (AppState { store: Arc::new(store), config: Arc::new(config) }, key, log_id)
+
+        TestHarness {
+            state: AppState { store: Arc::new(store), config: Arc::new(config) },
+            log_key,
+            log_id,
+            genesis_leaf,
+        }
     }
 
     fn envelope_bytes(n: u8) -> Vec<u8> {
@@ -477,10 +547,6 @@ mod tests {
             "payload": { "n": n },
             "signatures": [ { "key_id": "sha256:aa", "sig": "base64:bb" } ],
         }))
-    }
-
-    fn entry_id_of(bytes: &[u8]) -> String {
-        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
     }
 
     async fn stage(app: &Router, bytes: &[u8]) -> StatusCode {
@@ -497,9 +563,7 @@ mod tests {
         response.status()
     }
 
-    /// A genuine RFC 6962 inclusion path (leaf to root) for `leaves[index]`, rendered as
-    /// `sha256:<hex>` strings — what a real Merkle inclusion proof looks like on the wire,
-    /// as opposed to a range proof's internal (differently ordered) node list.
+    /// A genuine RFC 6962 inclusion path (leaf to root) for `leaves[index]`.
     fn inclusion_path_for(leaves: &[Hash], index: u64) -> Vec<String> {
         let tree_size = u64::try_from(leaves.len()).expect("small test size");
         let proof =
@@ -514,34 +578,37 @@ mod tests {
         ahl_core::proof_path_hex(&proof)
     }
 
-    /// Signs a checkpoint whose root genuinely commits `entries`, and (if `with_proofs`)
-    /// attaches an inclusion proof for every entry so the checkpoint POST promotes them in
-    /// the same call.
+    /// Signs a checkpoint whose root genuinely commits `harness.genesis_leaf` followed by
+    /// `new_entries` (indices `[1, 1+new_entries.len())`), and (if `with_proofs`) attaches an
+    /// inclusion proof for every new entry so the checkpoint POST promotes them in the same
+    /// call.
     fn signed_checkpoint_for(
-        key: &ahl_core::TestKey,
-        log_id: &str,
-        entries: &[Vec<u8>],
+        harness: &TestHarness,
+        new_entries: &[Vec<u8>],
+        time: &str,
         with_proofs: bool,
     ) -> (Checkpoint, Vec<PendingPromotion>) {
-        let leaves: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+        let mut leaves = vec![harness.genesis_leaf];
+        leaves.extend(new_entries.iter().map(|b| log_leaf_hash(b)));
+        let tree_size = u64::try_from(leaves.len()).expect("small test size");
         let root = atl_core::core::merkle::compute_root(&leaves);
         let mut cp = Checkpoint {
-            log_id: log_id.to_owned(),
-            tree_size: u64::try_from(entries.len()).expect("small test size"),
+            log_id: harness.log_id.clone(),
+            tree_size,
             root_hash: format!("sha256:{}", hex::encode(root)),
-            checkpoint_time: "2026-01-01T00:00:00.000000000Z".to_owned(),
-            key_id: key.key_id(),
+            checkpoint_time: time.to_owned(),
+            key_id: harness.log_key.key_id(),
             signature: String::new(),
         };
         let blob = crate::checkpoint::checkpoint_blob(&cp).expect("well-formed");
-        cp.signature = key.sign(&blob);
+        cp.signature = harness.log_key.sign(&blob);
 
         let pending = if with_proofs {
-            entries
+            new_entries
                 .iter()
                 .enumerate()
                 .map(|(i, bytes)| {
-                    let index = u64::try_from(i).expect("small test size");
+                    let index = 1 + u64::try_from(i).expect("small test size");
                     PendingPromotion {
                         entry_id: entry_id_of(bytes),
                         leaf_index: index,
@@ -570,8 +637,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_reports_ok() {
-        let (state, _, _) = test_state();
-        let app = router(state);
+        let app = router(harness().state);
         let response = app
             .oneshot(Request::get("/health").body(Body::empty()).expect("valid request"))
             .await
@@ -583,8 +649,7 @@ mod tests {
     async fn staging_alone_never_makes_an_entry_retrievable() {
         // The admission-without-evidence fix, at the HTTP boundary: staging succeeds, but
         // retrieval reports the entry absent until it is promoted with a proof.
-        let (state, _, _) = test_state();
-        let app = router(state);
+        let app = router(harness().state);
         let bytes = envelope_bytes(1);
         assert_eq!(stage(&app, &bytes).await, StatusCode::CREATED);
 
@@ -597,13 +662,17 @@ mod tests {
 
     #[tokio::test]
     async fn stage_promote_and_retrieve_round_trips_byte_exact() {
-        let (state, key, log_id) = test_state();
-        let app = router(state);
+        let hx = harness();
+        let app = router(hx.state.clone());
         let bytes = envelope_bytes(1);
         assert_eq!(stage(&app, &bytes).await, StatusCode::CREATED);
 
-        let (cp, pending) =
-            signed_checkpoint_for(&key, &log_id, std::slice::from_ref(&bytes), true);
+        let (cp, pending) = signed_checkpoint_for(
+            &hx,
+            std::slice::from_ref(&bytes),
+            "2026-01-01T00:00:00.000000000Z",
+            true,
+        );
         assert_eq!(submit_checkpoint(&app, &cp, &pending).await, StatusCode::CREATED);
 
         let request = Request::get(format!("/v1/entries/{}", entry_id_of(&bytes)))
@@ -621,14 +690,18 @@ mod tests {
         // authority behind them, then try to promote them under a checkpoint whose root
         // does not commit them. No proof exists, so promotion — and thus retrievability —
         // never happens, and the index remains free for the genuine entry.
-        let (state, key, log_id) = test_state();
-        let app = router(state);
+        let hx = harness();
+        let app = router(hx.state.clone());
         let attacker_bytes = envelope_bytes(0xAA);
         assert_eq!(stage(&app, &attacker_bytes).await, StatusCode::CREATED);
 
         let genuine_bytes = envelope_bytes(1);
-        let (cp, genuine_pending) =
-            signed_checkpoint_for(&key, &log_id, std::slice::from_ref(&genuine_bytes), true);
+        let (cp, genuine_pending) = signed_checkpoint_for(
+            &hx,
+            std::slice::from_ref(&genuine_bytes),
+            "2026-01-01T00:00:00.000000000Z",
+            true,
+        );
         // Splice the attacker's entry id onto the genuine proof material.
         let forged_pending = vec![PendingPromotion {
             entry_id: entry_id_of(&attacker_bytes),
@@ -645,21 +718,25 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_promotion_works_against_an_already_admitted_checkpoint() {
-        let (state, key, log_id) = test_state();
-        let app = router(state);
+        let hx = harness();
+        let app = router(hx.state.clone());
         let bytes = envelope_bytes(1);
         assert_eq!(stage(&app, &bytes).await, StatusCode::CREATED);
 
-        let (cp, pending) =
-            signed_checkpoint_for(&key, &log_id, std::slice::from_ref(&bytes), false);
+        let (cp, pending) = signed_checkpoint_for(
+            &hx,
+            std::slice::from_ref(&bytes),
+            "2026-01-01T00:00:00.000000000Z",
+            false,
+        );
         assert_eq!(submit_checkpoint(&app, &cp, &pending).await, StatusCode::CREATED);
 
-        let leaves = [log_leaf_hash(&bytes)];
-        let path = inclusion_path_for(&leaves, 0);
+        let leaves = [hx.genesis_leaf, log_leaf_hash(&bytes)];
+        let path = inclusion_path_for(&leaves, 1);
         let body = json!({
             "entry_id": entry_id_of(&bytes),
-            "tree_size": 1,
-            "leaf_index": 0,
+            "tree_size": 2,
+            "leaf_index": 1,
             "inclusion_path": path,
         });
         let request = Request::post("/v1/entries/promote")
@@ -678,8 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn promoting_against_an_unknown_checkpoint_is_a_404() {
-        let (state, _, _) = test_state();
-        let app = router(state);
+        let app = router(harness().state);
         let bytes = envelope_bytes(1);
         assert_eq!(stage(&app, &bytes).await, StatusCode::CREATED);
         let body = json!({
@@ -698,8 +774,7 @@ mod tests {
 
     #[tokio::test]
     async fn retrieving_an_absent_entry_is_a_404_not_an_error() {
-        let (state, _, _) = test_state();
-        let app = router(state);
+        let app = router(harness().state);
         let request =
             Request::get("/v1/entries/sha256:missing").body(Body::empty()).expect("valid request");
         let response = app.oneshot(request).await.expect("service call");
@@ -708,8 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_stage_request_is_a_400() {
-        let (state, _, _) = test_state();
-        let app = router(state);
+        let app = router(harness().state);
         let body = json!({
             "entry_id": "sha256:00",
             "envelope_base64": "not-base64-prefixed",
@@ -725,17 +799,19 @@ mod tests {
 
     #[tokio::test]
     async fn range_and_checkpoint_round_trip_over_http() {
-        let (state, key, log_id) = test_state();
-        let app = router(state);
+        let hx = harness();
+        let app = router(hx.state.clone());
 
         let entries: Vec<Vec<u8>> = (0u8..6).map(envelope_bytes).collect();
         for bytes in &entries {
             assert_eq!(stage(&app, bytes).await, StatusCode::CREATED);
         }
-        let (cp, pending) = signed_checkpoint_for(&key, &log_id, &entries, true);
+        let (cp, pending) =
+            signed_checkpoint_for(&hx, &entries, "2026-01-01T00:00:00.000000000Z", true);
         assert_eq!(submit_checkpoint(&app, &cp, &pending).await, StatusCode::CREATED);
 
-        let range_body = json!({ "tree_size": 6, "from_index": 1, "to_index": 4 });
+        // tree_size is 7: the genesis manifest plus the 6 staged entries.
+        let range_body = json!({ "tree_size": 7, "from_index": 2, "to_index": 5 });
         let request = Request::post("/v1/range")
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&range_body).expect("serialize")))
@@ -755,9 +831,12 @@ mod tests {
         let response = app.clone().oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let request = Request::get("/v1/checkpoints/6").body(Body::empty()).expect("valid request");
+        let request = Request::get("/v1/checkpoints/7").body(Body::empty()).expect("valid request");
         let response = app.clone().oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let reported: ReportedCheckpoint = serde_json::from_slice(&body).expect("json");
+        assert_eq!(reported.state, crate::checkpoint::CheckpointState::SeriesUsable);
 
         let request =
             Request::get("/v1/checkpoints/99").body(Body::empty()).expect("valid request");
@@ -768,12 +847,11 @@ mod tests {
         let response = app.clone().oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.expect("body").to_bytes();
-        let series: Vec<crate::checkpoint::Checkpoint> =
-            serde_json::from_slice(&body).expect("json");
+        let series: Vec<ReportedCheckpoint> = serde_json::from_slice(&body).expect("json");
         assert_eq!(series.len(), 1);
 
         let request =
-            Request::get("/v1/consistency?from=6&to=6").body(Body::empty()).expect("valid request");
+            Request::get("/v1/consistency?from=7&to=7").body(Body::empty()).expect("valid request");
         let response = app.clone().oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.expect("body").to_bytes();
@@ -793,8 +871,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_checkpoint_range_request_is_a_404() {
-        let (state, _, _) = test_state();
-        let app = router(state);
+        let app = router(harness().state);
         let range_body = json!({ "tree_size": 99, "from_index": 0, "to_index": 1 });
         let request = Request::post("/v1/range")
             .header("content-type", "application/json")
@@ -805,15 +882,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_range_request_against_an_authenticated_but_not_series_usable_checkpoint_is_a_409() {
+        let hx = harness();
+        let app = router(hx.state.clone());
+        // Never stage/promote the new entry: cp is admitted (signature-only), but its root
+        // can never be recomputed, so it stays merely authenticated.
+        let unrelated: Vec<Vec<u8>> = (90u8..91).map(envelope_bytes).collect();
+        let (cp, _pending) =
+            signed_checkpoint_for(&hx, &unrelated, "2026-01-01T00:00:00.000000000Z", false);
+        assert_eq!(submit_checkpoint(&app, &cp, &[]).await, StatusCode::CREATED);
+
+        let range_body = json!({ "tree_size": 2, "from_index": 0, "to_index": 1 });
+        let request = Request::post("/v1/range")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&range_body).expect("serialize")))
+            .expect("valid request");
+        let response = app.oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
     async fn a_checkpoint_ingest_with_a_bad_signature_is_a_400() {
-        let (state, key, log_id) = test_state();
-        let app = router(state);
+        let hx = harness();
+        let app = router(hx.state.clone());
         let cp = crate::checkpoint::Checkpoint {
-            log_id,
+            log_id: hx.log_id.clone(),
             tree_size: 1,
-            root_hash: format!("sha256:{}", "00".repeat(32)),
+            root_hash: format!("sha256:{}", hex::encode(hx.genesis_leaf)),
             checkpoint_time: "2026-01-01T00:00:00.000000000Z".to_owned(),
-            key_id: key.key_id(),
+            key_id: hx.log_key.key_id(),
             signature: "base64:AAAA".to_owned(),
         };
         assert_eq!(submit_checkpoint(&app, &cp, &[]).await, StatusCode::BAD_REQUEST);
@@ -822,29 +919,62 @@ mod tests {
     #[tokio::test]
     async fn a_checkpoint_signed_outside_its_key_validity_range_is_a_400() {
         // The "checkpoint signed by a key outside its validity range" negative test,
-        // exercised end to end over HTTP: the genesis key is configured valid only from
-        // index 5, and the checkpoint commits just 1 entry.
-        let key = ahl_core::TestKey::from_seed_hex("log-1", &"aa".repeat(32)).expect("seed");
-        let log_id = format!("sha256:{}", "88".repeat(32));
+        // exercised end to end over HTTP: the log key is declared valid only from index 5,
+        // and the bootstrap checkpoint commits just the genesis manifest (tree_size 1).
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"91".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log-1", &"92".repeat(32)).expect("seed");
+        let log_id = format!("sha256:{}", "93".repeat(32));
+        let genesis_payload = json!({
+            "type": "manifest",
+            "producer": "producer-1",
+            "keys": [
+                { "key_id": producer.key_id(), "pubkey": producer.pubkey(), "valid_from_index": 0 }
+            ],
+            "log": {
+                "log_id": log_id,
+                "operator": "op-1",
+                "adaptor": { "id": "ahl-adaptor-atl-v1", "hash": "sha256:00" },
+                "checkpoint_cadence": "PT5M",
+                "cadence_epoch": "2026-01-01T00:00:00Z",
+                "witness_grace_period": "PT10M",
+                "keys": [
+                    { "key_id": log_key.key_id(), "pubkey": log_key.pubkey(), "valid_from_index": 5 }
+                ],
+            },
+        });
+        let genesis_bytes = ahl_core::jcs(&ahl_core::envelope(genesis_payload, &producer));
+        let genesis_id = entry_id_of(&genesis_bytes);
+        let genesis_leaf = log_leaf_hash(&genesis_bytes);
+
+        let store = Store::open_in_memory().expect("in-memory store");
+        store.stage_entry(&genesis_id, &genesis_bytes).expect("stage genesis");
+        store.promote_entry(0, &genesis_id).expect("promote genesis");
         let config = Config::resolve(&ConfigSpec {
             log_id: log_id.clone(),
-            keys: vec![TrustedLogKeySpec {
-                key_id: key.key_id(),
-                pubkey: key.pubkey(),
-                valid_from_index: 5,
+            genesis_manifest_entry_id: genesis_id,
+            genesis_producer_keys: vec![KeyObjectSpec {
+                key_id: producer.key_id(),
+                pubkey: producer.pubkey(),
+                valid_from_index: 0,
             }],
-            genesis_manifest_entry_id: None,
-            genesis_checkpoint_cadence_seconds: None,
             store_path: ":memory:".to_owned(),
         })
         .expect("valid config");
-        let store = Store::open_in_memory().expect("in-memory store");
         let app = router(AppState { store: Arc::new(store), config: Arc::new(config) });
 
-        let bytes = envelope_bytes(1);
-        assert_eq!(stage(&app, &bytes).await, StatusCode::CREATED);
-        let (cp, pending) = signed_checkpoint_for(&key, &log_id, &[bytes], true);
-        assert_eq!(submit_checkpoint(&app, &cp, &pending).await, StatusCode::BAD_REQUEST);
+        let root = atl_core::core::merkle::compute_root(&[genesis_leaf]);
+        let mut cp = Checkpoint {
+            log_id,
+            tree_size: 1,
+            root_hash: format!("sha256:{}", hex::encode(root)),
+            checkpoint_time: "2026-01-01T00:00:00.000000000Z".to_owned(),
+            key_id: log_key.key_id(),
+            signature: String::new(),
+        };
+        let blob = crate::checkpoint::checkpoint_blob(&cp).expect("well-formed");
+        cp.signature = log_key.sign(&blob);
+        assert_eq!(submit_checkpoint(&app, &cp, &[]).await, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -852,50 +982,30 @@ mod tests {
         // The "ITUB query against an incomplete series" negative test, over HTTP: two
         // checkpoints admitted whose time gap exceeds the declared cadence, so no covering
         // member is within the proven-gap-free frontier.
-        let (state, key, log_id) = test_state(); // cadence: 300 seconds
-        let app = router(state);
+        let hx = harness(); // cadence: 5 minutes
+        let app = router(hx.state.clone());
 
         let first: Vec<Vec<u8>> = (0u8..4).map(envelope_bytes).collect();
         for bytes in &first {
             assert_eq!(stage(&app, bytes).await, StatusCode::CREATED);
         }
-        let (cp1, pending1) = signed_checkpoint_for(&key, &log_id, &first, true);
+        let (cp1, pending1) =
+            signed_checkpoint_for(&hx, &first, "2026-01-01T00:00:00.000000000Z", true);
         assert_eq!(submit_checkpoint(&app, &cp1, &pending1).await, StatusCode::CREATED);
 
-        let all_nine: Vec<Vec<u8>> = (0u8..9).map(envelope_bytes).collect();
-        for bytes in &all_nine[4..] {
+        let more: Vec<Vec<u8>> = (4u8..9).map(envelope_bytes).collect();
+        for bytes in &more {
             assert_eq!(stage(&app, bytes).await, StatusCode::CREATED);
         }
-        let leaves: Vec<Hash> = all_nine.iter().map(|b| log_leaf_hash(b)).collect();
-        let root = atl_core::core::merkle::compute_root(&leaves);
-        let mut cp2 = Checkpoint {
-            log_id: log_id.clone(),
-            tree_size: 9,
-            root_hash: format!("sha256:{}", hex::encode(root)),
-            // Three hours after cp1, far beyond the 300-second cadence: an undetected-by-
-            // consistency-alone gap.
-            checkpoint_time: "2026-01-01T03:00:00.000000000Z".to_owned(),
-            key_id: key.key_id(),
-            signature: String::new(),
-        };
-        let blob = crate::checkpoint::checkpoint_blob(&cp2).expect("well-formed");
-        cp2.signature = key.sign(&blob);
-        let pending2: Vec<PendingPromotion> = all_nine[4..]
-            .iter()
-            .enumerate()
-            .map(|(offset, bytes)| {
-                let index = 4 + u64::try_from(offset).expect("small test size");
-                PendingPromotion {
-                    entry_id: entry_id_of(bytes),
-                    leaf_index: index,
-                    inclusion_path: inclusion_path_for(&leaves, index),
-                }
-            })
-            .collect();
+        let all_new: Vec<Vec<u8>> = first.iter().chain(more.iter()).cloned().collect();
+        // Three hours after cp1, far beyond the 5-minute cadence: an undetected-by-
+        // consistency-alone gap.
+        let (cp2, pending2) =
+            signed_checkpoint_for(&hx, &all_new, "2026-01-01T03:00:00.000000000Z", true);
         assert_eq!(submit_checkpoint(&app, &cp2, &pending2).await, StatusCode::CREATED);
 
         // Covered by cp2's tree_size, but beyond the gap-free frontier (which stops at cp1).
-        let request = Request::get("/v1/itub/5").body(Body::empty()).expect("valid request");
+        let request = Request::get("/v1/itub/6").body(Body::empty()).expect("valid request");
         let response = app.clone().oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
@@ -907,8 +1017,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_consistency_request_for_an_unknown_checkpoint_is_a_404() {
-        let (state, _, _) = test_state();
-        let app = router(state);
+        let app = router(harness().state);
         let request =
             Request::get("/v1/consistency?from=0&to=5").body(Body::empty()).expect("valid request");
         let response = app.oneshot(request).await.expect("service call");

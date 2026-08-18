@@ -12,13 +12,14 @@
 //! `store` module docs for the storage-level half of this design.
 
 use atl_core::core::merkle::{verify_inclusion, Hash};
+use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::checkpoint::Checkpoint;
 use crate::error::{MirrorError, MirrorResult};
 use crate::metadata::{adaptor_metadata_bytes, log_leaf_hash};
-use crate::store::{InsertOutcome, Store};
+use crate::store::{self, InsertOutcome, Store};
 
 /// Verify `bytes` against the profile's format checks and, if they all pass, stage them
 /// under their entry id.
@@ -130,8 +131,30 @@ pub fn promote_entry(
     leaf_index: u64,
     inclusion_path: &[String],
 ) -> MirrorResult<InsertOutcome> {
-    let bytes = store
-        .get_staged(entry_id)?
+    store.with_conn(|conn| promote_entry_in(conn, checkpoint, entry_id, leaf_index, inclusion_path))
+}
+
+/// The `&Connection` core of [`promote_entry`].
+///
+/// Usable standalone (via the crate-private `Store::with_conn`, see [`promote_entry`] above)
+/// or composed
+/// inside a caller's own transaction (see [`crate::checkpoint::ingest_checkpoint`], which
+/// promotes an entire `entries_to_promote` batch and records the checkpoint in one
+/// transaction so a failure partway through leaves no trace). Callers already holding the
+/// store's connection MUST use this rather than [`promote_entry`], which would deadlock by
+/// re-locking the store's mutex.
+///
+/// # Errors
+///
+/// Same as [`promote_entry`].
+pub fn promote_entry_in(
+    conn: &Connection,
+    checkpoint: &Checkpoint,
+    entry_id: &str,
+    leaf_index: u64,
+    inclusion_path: &[String],
+) -> MirrorResult<InsertOutcome> {
+    let bytes = store::get_staged_raw(conn, entry_id)?
         .ok_or_else(|| MirrorError::NotStaged { entry_id: entry_id.to_owned() })?;
 
     let root: Hash = ahl_core::parse_hash_hex(&checkpoint.root_hash)?;
@@ -143,7 +166,7 @@ pub fn promote_entry(
         });
     }
 
-    store.promote_entry(leaf_index, entry_id)
+    store::promote_entry_raw(conn, leaf_index, entry_id)
 }
 
 #[cfg(test)]

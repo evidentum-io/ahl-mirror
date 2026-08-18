@@ -105,16 +105,16 @@ scans over the checkpoint set for gap-free-frontier computation; and an efficien
 contiguous-range scan for enumeration (§10.3). One file, one dependency, no server — which is
 what the brief's "simple durable local store" asks for.
 
-Concurrency: all access is serialized behind one connection and one mutex, and multi-step
-admission (build the visible entry prefix, resolve governance, verify a signature, promote
-entries, insert a checkpoint) is a sequence of individually-safe calls rather than one
-database transaction — every query still runs inside `tokio::task::spawn_blocking` so a slow
-database call never stalls the async runtime. Each step re-checks its own preconditions at
-call time, so a concurrent request interleaved between steps can only ever cause a later step
-to fail closed (a fresh conflict or an incomplete-range error), never to admit something
-unverified. A mirror is single-writer by construction (one producer, one log, per adaptor
-profile §3), so this is a documented simplification, not a silent gap — a deployment with
-many concurrent writers would want real transactions here first.
+Concurrency: all access is serialized behind one connection and one mutex, and every query
+still runs inside `tokio::task::spawn_blocking` so a slow database call never stalls the async
+runtime. Admission has two phases: building the visible entry prefix, resolving governance,
+and verifying the checkpoint's signature are read-only and run first; promoting every entry in
+the batch and recording the checkpoint itself are writes, and run inside one `SQLite`
+transaction (`Store::with_transaction`), so a batch that fails partway — a bad inclusion proof
+on the last of several `entries_to_promote`, say — leaves the store exactly as it was before
+the request, never partially admitted. A mirror is single-writer by construction (one
+producer, one log, per adaptor profile §3), so cross-request transactions on top of this are
+not needed.
 
 ## What is implemented
 
@@ -157,17 +157,24 @@ many concurrent writers would want real transactions here first.
   endpoint, or `ITUB`; an authenticated-but-not-series-usable checkpoint is retained and
   reported as such (`GET /v1/checkpoints` shows every authenticated member's state).
 - **A gap-free-frontier computation that matches core spec §7.3's corrected rules.** The
-  frontier never assumes the earliest *observed* series-usable checkpoint begins a
-  provably-complete range — it must start at `cadence_epoch` (within one cadence interval of
-  it, using the genesis-governed cadence, since nothing precedes genesis) or at a `tree_size`
-  equal to `genesis_entry_index + 1` (the only `tree_size` whose predecessor is provably the
-  genesis state, since a corpus always contains at least its genesis manifest). Each interval
-  is judged by the cadence of the manifest version governing its **earlier** member — the
-  same "greatest entry index below the checkpoint's `tree_size`" rule used for keys, never a
-  separate rule for cadence, and never applied retroactively across a later cadence change.
+  series has exactly one start, `cadence_epoch`; the genesis checkpoint (`tree_size ==
+  genesis_entry_index + 1`) plays no anchoring role — it need not even be published. Instead,
+  the earliest series-usable checkpoint committing the genesis manifest MUST carry a
+  `checkpoint_time` within one cadence interval of `cadence_epoch`, using the genesis-governed
+  cadence (since nothing precedes genesis); outside that window, the frontier is
+  `FrontierStop::NoValidStart` regardless of that checkpoint's `tree_size`. Each subsequent
+  interval is judged by the cadence of the manifest version governing its **earlier** member —
+  the same "greatest entry index below the checkpoint's `tree_size`" rule used for keys, never
+  a separate rule for cadence, and never applied retroactively across a later cadence change.
   `checkpoint_time` MUST be non-decreasing; a decrease is reported as a distinct
-  `FrontierStop::DecreasingTime` violation, never folded into an ordinary gap. `ITUB` returns
-  a value only for a series-usable member within the resulting frontier.
+  `FrontierStop::DecreasingTime` violation, never folded into an ordinary gap. The series is
+  ordered `(tree_size, checkpoint_time)` ascending, not `tree_size` alone (a quiet log
+  republishes at unchanged `tree_size`); `checkpoint::series_view` also reports
+  `root_divergences` — `tree_size` values where two authenticated members disagree on
+  `root_hash`, detectable purely from checkpoint metadata, independent of which entries this
+  mirror happens to hold. `ITUB` returns a value only for a series-usable member within the
+  resulting frontier, and where a `tree_size` carries several series-usable members, the one
+  with the **earliest** `checkpoint_time` governs.
 - **Retrieval by entry id** (adaptor profile §10.1.1, unchanged in shape): present returns the
   stored bytes unaltered (raw `application/json`, or a `base64:` text form via
   `?encoding=base64`), absent is a 404 with an explicit note that absence is a fact about the
@@ -180,41 +187,48 @@ many concurrent writers would want real transactions here first.
 
 ## Where the profile was ambiguous or under-specified
 
-Reported as asked, for the next specification round — not papered over. The prior round's
-open points are addressed first (two were closed outright by the newly-published core spec
-§7.3, cited where relevant); the rest are new, surfaced by this round's fixes.
+Reported as asked, for the next specification round — not papered over. Points closed by the
+now-published core spec §7.3 are marked as such, most recently by commit `9962750` ("fix
+series start, ties and comparison"), which closed items 4 and 5 below outright and corrected
+this crate's own prior guess on item 4 in the process; the rest are new, surfaced by this
+round's fixes.
 
-1. **Resolved by core spec §7.3**: the manifest `log` object's schema (field names, that
-   `checkpoint_cadence`/`witness_grace_period` are ISO 8601 durations and `cadence_epoch` is
-   RFC 3339) is now normative. This crate's `manifest`/`duration` modules implement it as
-   published. One residual implementer's choice remains: ISO 8601 calendar components `Y`
-   (years) and `M` (months) have no fixed length in the standard itself. `duration::parse_iso8601_duration_nanos`
-   converts them with fixed civil-calendar-free approximations (365 days/year, 30 days/month)
-   — exact for the seconds-through-days cadences a checkpoint cadence realistically uses, not
-   exact for one declared in years or months. Flagged in the module's own docs.
+1. **Resolved by core spec §7.3, no residual choice left**: the manifest `log` object's schema
+   (field names, that `checkpoint_cadence`/`witness_grace_period` are ISO 8601 durations
+   restricted to time components only, and `cadence_epoch` is RFC 3339) is now normative. Only
+   `P[n]DT[n]H[n]M[n]S` is legal; a value carrying `Y`, or `M` in the date part, is malformed
+   and `duration::parse_iso8601_duration_nanos` rejects it with a distinct
+   [`MirrorError::ProhibitedDurationComponent`] rather than approximating a length for a
+   calendar component that does not have a fixed one. (An earlier draft of this crate
+   approximated `Y`/`M` at 365/30 days; the published spec text forecloses that reading, and
+   this crate no longer does it.)
 2. **Resolved by core spec §7.3**: "gap-free" is no longer just "a consistency proof from the
    predecessor is available" (which pairwise RFC 9162 consistency satisfies trivially and
    cannot, by construction, detect an omitted checkpoint). The cadence rule, the
-   non-decreasing-time rule, and the explicit range-start conditions in §7.3 are exactly what
+   non-decreasing-time rule, and the explicit range-start condition in §7.3 are exactly what
    `checkpoint::compute_gap_free_frontier` implements.
 3. **Resolved by core spec §7.3**: whether a checkpoint may be admitted before this mirror
    holds every entry it commits is now explicit — the authenticated/series-usable split. This
    crate's `ingest_checkpoint` implements it as specified.
-4. **The exact operational meaning of "a checkpoint whose predecessor is the genesis state"
-   is not spelled out beyond the phrase itself.** This crate reads it as: the `tree_size` at
-   which a checkpoint's committed range provably cannot have anything before it, which is
-   `genesis_entry_index + 1` — the smallest `tree_size` any checkpoint can ever have, since a
-   corpus always contains at least its genesis manifest (core spec §8.1). No other reading was
-   apparent from the text; flagged in case the intended definition is broader (e.g. any
-   `tree_size` reachable from genesis via a chain of *verified* — not merely present —
-   checkpoints, which core spec §7.3 does not describe a mechanism for establishing either).
-5. **Which manifest version's cadence governs the interval between `cadence_epoch` and the
-   first real checkpoint is not stated.** §7.3 fixes the rule for intervals *between two
-   checkpoints* ("the version governing its earlier member") but the epoch is not a
-   checkpoint. This crate resolves governance at `genesis_entry_index + 1` (necessarily the
-   genesis version, since no rotation can precede the entry that establishes it) and uses
-   *that* cadence for the epoch-to-first-member interval — the position-wise earliest
-   governing version there could ever be. Reported as an inference, not a quotation.
+4. **Resolved by core spec §7.3 — and this crate's own earlier guess on this point was
+   superseded, not merely underspecified.** An earlier draft of this crate read a checkpoint's
+   *genesis state* as `tree_size = genesis_entry_index + 1` (its own term for what §7.3 later
+   named the *genesis checkpoint*) and treated that `tree_size` as an alternative, tree-size-
+   based way for a series to start, alongside starting within cadence of `cadence_epoch`. §7.3
+   now states this plainly: "the genesis checkpoint … need not be published, and is not a
+   start point." The series has exactly one start — `cadence_epoch` — constrained instead by a
+   corpus-validity window: the earliest checkpoint committing the genesis manifest MUST carry
+   a `checkpoint_time` in `[cadence_epoch, cadence_epoch + checkpoint_cadence]` of the genesis
+   version. `checkpoint::compute_gap_free_frontier` implements this window check and no longer
+   treats `genesis_entry_index + 1` as a start condition in its own right; the corresponding
+   test that exercised the old alternative-start reading was corrected to assert the new,
+   single-start behavior (`a_checkpoint_at_the_genesis_checkpoint_size_outside_the_epoch_window_does_not_start_the_series`)
+   rather than removed, so the now-wrong case stays covered.
+5. **Resolved by core spec §7.3**: which manifest version's cadence governs the interval
+   between `cadence_epoch` and the first published checkpoint is now stated directly — "judged
+   under the genesis manifest version's cadence, since no earlier version exists to govern it"
+   — matching what this crate had inferred (and flagged as an inference) before the text
+   confirmed it.
 6. **§10.1.1's "MAY additionally carry the entry index and an inclusion proof"** is optional
    ("MAY") and this crate does not implement it on the plain retrieval path — only the range
    endpoint returns proofs. A caller wanting an inclusion proof for a single entry can request

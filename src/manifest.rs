@@ -122,10 +122,17 @@ impl GovernanceState {
         self.governing_manifest_entry_index
     }
 
-    /// The entry index of the verified genesis manifest — fixed for the whole corpus. A
-    /// checkpoint whose `tree_size` equals `genesis_entry_index + 1` covers nothing but the
-    /// genesis manifest itself: nothing could exist before it (core spec §7.3, "a checkpoint
-    /// whose predecessor is the genesis state").
+    /// The entry index of the verified genesis manifest — fixed for the whole corpus.
+    ///
+    /// `genesis_entry_index + 1` is the `tree_size` of the corpus's *genesis checkpoint* —
+    /// core spec §7.3 defines it as "the checkpoint whose `tree_size` equals the genesis
+    /// manifest's entry index plus one" — but that checkpoint "need not be published, and is
+    /// not a start point" (§7.3): it plays no role in judging series completeness. What this
+    /// value grounds instead is the corpus-validity window check: the *earliest* checkpoint
+    /// that *commits* the genesis manifest (any series-usable checkpoint with `tree_size >=
+    /// genesis_entry_index + 1`) MUST fall within `[cadence_epoch, cadence_epoch +
+    /// checkpoint_cadence]` of the genesis manifest version (see the private
+    /// `compute_gap_free_frontier` in [`crate::checkpoint`]).
     #[must_use]
     pub const fn genesis_entry_index(&self) -> u64 {
         self.genesis_entry_index

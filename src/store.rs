@@ -34,16 +34,15 @@
 //! entry id and the entry index exactly as the brief specifies; `SQLite` is the file format,
 //! not an architectural commitment beyond that.
 //!
-//! Concurrency: the store serializes all access behind one connection and one mutex, and
-//! multi-step admission (resolve a governance key, verify a signature, promote several
-//! entries, insert a checkpoint — see [`crate::checkpoint::ingest_checkpoint`]) is a sequence
-//! of individually-safe calls rather than one database transaction. Each step re-checks its
-//! own preconditions at call time, so a concurrent request interleaved between steps can only
-//! ever cause a later step to fail closed (a fresh conflict or an incomplete-range error),
-//! never to admit something unverified. A mirror is single-writer by construction (one
-//! producer, one log, per adaptor profile §3), so this is a documented simplification, not a
-//! silent gap: a deployment with many concurrent writers would want real transactions here
-//! first.
+//! Concurrency: the store serializes all access behind one connection and one mutex.
+//! Governance resolution and signature verification (read-only) happen before any write; the
+//! writes themselves — promoting every entry in a checkpoint's `entries_to_promote` batch and
+//! recording the checkpoint — run inside one `SQLite` transaction (see the crate-private
+//! `Store::with_transaction` and [`crate::checkpoint::ingest_checkpoint`]), so a batch that
+//! fails partway (a bad proof on the third of five entries, say) leaves the store exactly as
+//! it was before the request, not partially applied. A mirror is single-writer by
+//! construction (one producer, one log, per adaptor profile §3), so cross-request
+//! transactions are not needed on top of this.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -139,7 +138,14 @@ impl Store {
     /// Run `f` with the locked connection, then drop the lock before returning `f`'s result —
     /// every store method funnels through here so the mutex guard's scope never outlives its
     /// last use.
-    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> MirrorResult<T>) -> MirrorResult<T> {
+    ///
+    /// `pub(crate)` so callers elsewhere in the crate (see [`crate::checkpoint`]) can compose
+    /// the lower-level `*_raw` functions below without going through a dedicated `Store`
+    /// method for every combination they need.
+    pub(crate) fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> MirrorResult<T>,
+    ) -> MirrorResult<T> {
         let conn = self
             .conn
             .lock()
@@ -147,6 +153,52 @@ impl Store {
         let result = f(&conn);
         drop(conn);
         result
+    }
+
+    /// Run `f` inside one `SQLite` transaction: commit if `f` returns `Ok`, roll back if it
+    /// returns `Err`, so `f`'s writes are all-or-nothing.
+    ///
+    /// This is what makes multi-step admission — promoting every entry in a checkpoint's
+    /// `entries_to_promote` batch, then recording the checkpoint itself (see
+    /// [`crate::checkpoint::ingest_checkpoint`]) — leave no trace on failure. `f` MUST use the
+    /// `*_raw` functions in this module (or other `&Connection`-based helpers) rather than
+    /// calling back into any `&Store`-based method: this method already holds the store's
+    /// single connection mutex for the duration of `f`, and `std::sync::Mutex` is not
+    /// reentrant, so a nested `Store` method call would deadlock.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::StoreInit`] if the mutex is poisoned, [`MirrorError::Store`] if starting
+    /// or committing the transaction fails, or whatever `f` itself returns (in which case the
+    /// transaction is rolled back before the error propagates).
+    // `significant_drop_tightening` wants the mutex guard `conn` dropped as soon as possible,
+    // but `tx` borrows `conn` mutably for its entire lifetime (`rusqlite::Transaction<'_>`), so
+    // the guard cannot be released before `tx` is committed or rolled back — the lint's
+    // suggested fix does not type-check. Holding the lock for the whole transaction is exactly
+    // the point of this method, not an oversight.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn with_transaction<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> MirrorResult<T>,
+    ) -> MirrorResult<T> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| MirrorError::StoreInit("store mutex poisoned".to_owned()))?;
+        let tx = conn.transaction().map_err(MirrorError::from)?;
+        match f(&tx) {
+            Ok(value) => {
+                tx.commit().map_err(MirrorError::from)?;
+                Ok(value)
+            }
+            Err(err) => {
+                // A rollback failure here does not leave the writes committed: an uncommitted
+                // `Transaction` also rolls back on drop, so `err` (the original failure) is
+                // always the right thing to report either way.
+                let _ = tx.rollback();
+                Err(err)
+            }
+        }
     }
 
     // -----------------------------------------------------------------------------------
@@ -199,15 +251,7 @@ impl Store {
     ///
     /// Returns [`MirrorError::Store`] on a database failure.
     pub fn get_staged(&self, entry_id: &str) -> MirrorResult<Option<Vec<u8>>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                "SELECT envelope FROM staged_entries WHERE entry_id = ?1",
-                [entry_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(MirrorError::from)
-        })
+        self.with_conn(|conn| get_staged_raw(conn, entry_id))
     }
 
     // -----------------------------------------------------------------------------------
@@ -244,66 +288,7 @@ impl Store {
     /// [`MirrorError::IndexConflict`], [`MirrorError::EntryIdAtDifferentIndex`], or
     /// [`MirrorError::Store`].
     pub fn promote_entry(&self, entry_index: u64, entry_id: &str) -> MirrorResult<InsertOutcome> {
-        let index_i64 = to_i64("entry_index", entry_index)?;
-        self.with_conn(|conn| {
-            let bytes: Vec<u8> = conn
-                .query_row(
-                    "SELECT envelope FROM staged_entries WHERE entry_id = ?1",
-                    [entry_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .ok_or_else(|| MirrorError::NotStaged { entry_id: entry_id.to_owned() })?;
-
-            let existing_at_index: Option<(String, Vec<u8>)> = conn
-                .query_row(
-                    "SELECT entry_id, envelope FROM entries WHERE entry_index = ?1",
-                    [index_i64],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((existing_id, existing_bytes)) = existing_at_index {
-                if existing_id == entry_id && existing_bytes == bytes {
-                    return Ok(InsertOutcome::AlreadyPresent);
-                }
-                return Err(MirrorError::IndexConflict {
-                    index: entry_index,
-                    existing_entry_id: existing_id,
-                    new_entry_id: entry_id.to_owned(),
-                });
-            }
-
-            let existing_index_for_id: Option<i64> = conn
-                .query_row(
-                    "SELECT entry_index FROM entries WHERE entry_id = ?1",
-                    [entry_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(existing_index) = existing_index_for_id {
-                return Err(MirrorError::EntryIdAtDifferentIndex {
-                    entry_id: entry_id.to_owned(),
-                    existing_index: to_u64("existing_index", existing_index)?,
-                    requested_index: entry_index,
-                });
-            }
-
-            let max: Option<i64> =
-                conn.query_row("SELECT MAX(entry_index) FROM entries", [], |row| row.get(0))?;
-            let expected = match max {
-                None => 0,
-                Some(m) => to_u64("next_index", m)? + 1,
-            };
-            if entry_index != expected {
-                return Err(MirrorError::OutOfOrderIndex { expected, got: entry_index });
-            }
-
-            conn.execute(
-                "INSERT INTO entries (entry_index, entry_id, envelope) VALUES (?1, ?2, ?3)",
-                params![index_i64, entry_id, bytes],
-            )?;
-            Ok(InsertOutcome::Inserted)
-        })
+        self.with_conn(|conn| promote_entry_raw(conn, entry_index, entry_id))
     }
 
     /// Fetch an entry by its AHL entry id.
@@ -335,16 +320,7 @@ impl Store {
     /// inside the range; callers that need completeness (range enumeration, consistency
     /// proofs) MUST check the returned count against the expected width.
     pub fn get_entries_range(&self, from_index: u64, to_index: u64) -> MirrorResult<Vec<Vec<u8>>> {
-        let from_i64 = to_i64("from_index", from_index)?;
-        let to_i64 = to_i64("to_index", to_index)?;
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT envelope FROM entries WHERE entry_index >= ?1 AND entry_index < ?2 \
-                 ORDER BY entry_index ASC",
-            )?;
-            let rows = stmt.query_map(params![from_i64, to_i64], |row| row.get(0))?;
-            rows.collect::<Result<Vec<Vec<u8>>, _>>().map_err(MirrorError::from)
-        })
+        self.with_conn(|conn| get_entries_range_raw(conn, from_index, to_index))
     }
 
     // -----------------------------------------------------------------------------------
@@ -371,37 +347,7 @@ impl Store {
     ///
     /// [`MirrorError::SeriesMemberConflict`] or [`MirrorError::Store`].
     pub fn insert_checkpoint(&self, cp: &Checkpoint) -> MirrorResult<InsertOutcome> {
-        let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
-        self.with_conn(|conn| {
-            let existing = row_to_checkpoint(conn.query_row(
-                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
-                 FROM checkpoints WHERE tree_size = ?1 AND checkpoint_time = ?2",
-                params![tree_size_i64, cp.checkpoint_time],
-                checkpoint_row,
-            ))?;
-            if let Some(existing) = existing {
-                if &existing == cp {
-                    return Ok(InsertOutcome::AlreadyPresent);
-                }
-                return Err(MirrorError::SeriesMemberConflict {
-                    tree_size: cp.tree_size,
-                    checkpoint_time: cp.checkpoint_time.clone(),
-                });
-            }
-            conn.execute(
-                "INSERT INTO checkpoints (tree_size, log_id, root_hash, checkpoint_time, \
-                 key_id, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    tree_size_i64,
-                    cp.log_id,
-                    cp.root_hash,
-                    cp.checkpoint_time,
-                    cp.key_id,
-                    cp.signature
-                ],
-            )?;
-            Ok(InsertOutcome::Inserted)
-        })
+        self.with_conn(|conn| insert_checkpoint_raw(conn, cp))
     }
 
     /// Fetch the most recently declared authenticated checkpoint at exactly `tree_size`
@@ -445,6 +391,134 @@ impl Store {
             rows.collect::<Result<Vec<Checkpoint>, _>>().map_err(MirrorError::from)
         })
     }
+}
+
+// -----------------------------------------------------------------------------------
+// `&Connection`-based cores, usable both standalone (via `Store::with_conn`) and inside a
+// transaction (via `Store::with_transaction`) — see the module docs' "Concurrency" section.
+// -----------------------------------------------------------------------------------
+
+/// The `&Connection` core of [`Store::get_staged`].
+pub(crate) fn get_staged_raw(conn: &Connection, entry_id: &str) -> MirrorResult<Option<Vec<u8>>> {
+    conn.query_row("SELECT envelope FROM staged_entries WHERE entry_id = ?1", [entry_id], |row| {
+        row.get(0)
+    })
+    .optional()
+    .map_err(MirrorError::from)
+}
+
+/// The `&Connection` core of [`Store::promote_entry`].
+pub(crate) fn promote_entry_raw(
+    conn: &Connection,
+    entry_index: u64,
+    entry_id: &str,
+) -> MirrorResult<InsertOutcome> {
+    let index_i64 = to_i64("entry_index", entry_index)?;
+    let bytes: Vec<u8> = conn
+        .query_row("SELECT envelope FROM staged_entries WHERE entry_id = ?1", [entry_id], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| MirrorError::NotStaged { entry_id: entry_id.to_owned() })?;
+
+    let existing_at_index: Option<(String, Vec<u8>)> = conn
+        .query_row(
+            "SELECT entry_id, envelope FROM entries WHERE entry_index = ?1",
+            [index_i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((existing_id, existing_bytes)) = existing_at_index {
+        if existing_id == entry_id && existing_bytes == bytes {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
+        return Err(MirrorError::IndexConflict {
+            index: entry_index,
+            existing_entry_id: existing_id,
+            new_entry_id: entry_id.to_owned(),
+        });
+    }
+
+    let existing_index_for_id: Option<i64> = conn
+        .query_row("SELECT entry_index FROM entries WHERE entry_id = ?1", [entry_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if let Some(existing_index) = existing_index_for_id {
+        return Err(MirrorError::EntryIdAtDifferentIndex {
+            entry_id: entry_id.to_owned(),
+            existing_index: to_u64("existing_index", existing_index)?,
+            requested_index: entry_index,
+        });
+    }
+
+    let max: Option<i64> =
+        conn.query_row("SELECT MAX(entry_index) FROM entries", [], |row| row.get(0))?;
+    let expected = match max {
+        None => 0,
+        Some(m) => to_u64("next_index", m)? + 1,
+    };
+    if entry_index != expected {
+        return Err(MirrorError::OutOfOrderIndex { expected, got: entry_index });
+    }
+
+    conn.execute(
+        "INSERT INTO entries (entry_index, entry_id, envelope) VALUES (?1, ?2, ?3)",
+        params![index_i64, entry_id, bytes],
+    )?;
+    Ok(InsertOutcome::Inserted)
+}
+
+/// The `&Connection` core of [`Store::get_entries_range`].
+pub(crate) fn get_entries_range_raw(
+    conn: &Connection,
+    from_index: u64,
+    to_index: u64,
+) -> MirrorResult<Vec<Vec<u8>>> {
+    let from_i64 = to_i64("from_index", from_index)?;
+    let to_i64 = to_i64("to_index", to_index)?;
+    let mut stmt = conn.prepare(
+        "SELECT envelope FROM entries WHERE entry_index >= ?1 AND entry_index < ?2 \
+         ORDER BY entry_index ASC",
+    )?;
+    let rows = stmt.query_map(params![from_i64, to_i64], |row| row.get(0))?;
+    rows.collect::<Result<Vec<Vec<u8>>, _>>().map_err(MirrorError::from)
+}
+
+/// The `&Connection` core of [`Store::insert_checkpoint`].
+pub(crate) fn insert_checkpoint_raw(
+    conn: &Connection,
+    cp: &Checkpoint,
+) -> MirrorResult<InsertOutcome> {
+    let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
+    let existing = row_to_checkpoint(conn.query_row(
+        "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
+         FROM checkpoints WHERE tree_size = ?1 AND checkpoint_time = ?2",
+        params![tree_size_i64, cp.checkpoint_time],
+        checkpoint_row,
+    ))?;
+    if let Some(existing) = existing {
+        if &existing == cp {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
+        return Err(MirrorError::SeriesMemberConflict {
+            tree_size: cp.tree_size,
+            checkpoint_time: cp.checkpoint_time.clone(),
+        });
+    }
+    conn.execute(
+        "INSERT INTO checkpoints (tree_size, log_id, root_hash, checkpoint_time, \
+         key_id, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            tree_size_i64,
+            cp.log_id,
+            cp.root_hash,
+            cp.checkpoint_time,
+            cp.key_id,
+            cp.signature
+        ],
+    )?;
+    Ok(InsertOutcome::Inserted)
 }
 
 fn checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {

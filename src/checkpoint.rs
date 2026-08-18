@@ -1,5 +1,15 @@
 //! Checkpoints, the canonical checkpoint series, and `ITUB` (core spec §7.3; adaptor profile
 //! §5.2, §6).
+//!
+//! # Series order
+//!
+//! The series is ordered by `(tree_size, checkpoint_time)` ascending, **not** `tree_size`
+//! alone: a quiet log republishes at unchanged `tree_size`, so `tree_size` does not totally
+//! order the series (core spec §7.3). [`crate::store::Store::all_checkpoints`] returns members
+//! in exactly this order — every consumer here ([`series_view`], [`itub`], and the private
+//! `compute_gap_free_frontier`) relies on it directly rather than re-sorting, and
+//! [`SeriesView::root_divergences`] makes explicit the corollary the ordering exists to
+//! support: members sharing a `tree_size` MUST carry the same `root_hash`.
 
 use atl_core::core::merkle::{compute_root, generate_consistency_proof, verify_consistency, Hash};
 use ed25519_dalek::VerifyingKey;
@@ -80,8 +90,12 @@ pub struct ReportedCheckpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum FrontierStop {
-    /// No series-usable member could establish a valid start: neither within cadence of
-    /// `cadence_epoch` nor at a `tree_size` whose predecessor is the genesis state.
+    /// The series has exactly one start: `cadence_epoch` (core spec §7.3). No series-usable
+    /// member could establish it, either because none exists yet, or because the earliest
+    /// series-usable checkpoint committing the genesis manifest carries a `checkpoint_time`
+    /// outside `[cadence_epoch, cadence_epoch + checkpoint_cadence]` of the genesis manifest
+    /// version — reaching back over an interval the corpus did not exist for, or leaving the
+    /// opening interval unjudged.
     NoValidStart,
     /// `checkpoint_time` decreased between two adjacent series-usable members — a violation
     /// and a finding, never treated as a zero-length gap (core spec §7.3).
@@ -114,6 +128,32 @@ pub struct SeriesView {
     /// alongside a `Some` frontier means extension reached the newest member cleanly; `None`
     /// alongside a `None` frontier means no member could even start a range.
     pub frontier_stop: Option<FrontierStop>,
+    /// `tree_size` values at which two or more authenticated members declare different
+    /// `root_hash` values — a finding: core spec §7.3 requires members sharing a `tree_size`
+    /// to carry the same `root_hash`, since a quiet log republishing at unchanged `tree_size`
+    /// is legitimate but must still commit to one root. Detected purely from checkpoint
+    /// metadata (no entries need be held), independent of `gap_free_frontier`.
+    pub root_divergences: Vec<u64>,
+}
+
+/// Find every `tree_size` at which two adjacent members of `checkpoints` (ordered ascending
+/// by `(tree_size, checkpoint_time)`, as [`Store::all_checkpoints`] returns them) declare
+/// different `root_hash` values — core spec §7.3's "members sharing a `tree_size` MUST carry
+/// the same `root_hash`" rule, made explicit rather than left as an implicit consequence of
+/// root recomputation (which only ever confirms one candidate right, never flags the other as
+/// specifically *conflicting*).
+fn find_root_divergences(checkpoints: &[Checkpoint]) -> Vec<u64> {
+    let mut divergences = Vec::new();
+    for window in checkpoints.windows(2) {
+        let [a, b] = window else { continue };
+        if a.tree_size == b.tree_size
+            && a.root_hash != b.root_hash
+            && divergences.last() != Some(&a.tree_size)
+        {
+            divergences.push(a.tree_size);
+        }
+    }
+    divergences
 }
 
 const CHECKPOINT_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
@@ -239,16 +279,26 @@ pub fn verify_series_consistency(
     Ok(verify_consistency(&proof, &from_root, &to_root)?)
 }
 
-/// Fetch the complete, contiguous log-leaf-hash sequence for `[0, tree_size)`, or report how
-/// far short the store is.
-fn leaf_hashes_for(store: &Store, tree_size: u64) -> MirrorResult<Vec<Hash>> {
-    let entries = store.get_entries_range(0, tree_size)?;
+/// Fetch the complete, contiguous log-leaf-hash sequence for `[0, tree_size)` from an
+/// already-open connection, or report how far short the store is.
+///
+/// The `&Connection` core of [`leaf_hashes_for`] — usable inside a transaction (see
+/// [`ingest_checkpoint`]), where calling [`leaf_hashes_for`] itself would deadlock by
+/// re-locking the store's mutex.
+fn leaf_hashes_for_conn(conn: &rusqlite::Connection, tree_size: u64) -> MirrorResult<Vec<Hash>> {
+    let entries = crate::store::get_entries_range_raw(conn, 0, tree_size)?;
     let have = u64::try_from(entries.len())
         .map_err(|_| MirrorError::IndexOverflow { what: "entries.len()" })?;
     if have != tree_size {
         return Err(MirrorError::IncompleteEntries { have, need: tree_size });
     }
     Ok(entries.iter().map(|bytes| log_leaf_hash(bytes)).collect())
+}
+
+/// Fetch the complete, contiguous log-leaf-hash sequence for `[0, tree_size)`, or report how
+/// far short the store is.
+fn leaf_hashes_for(store: &Store, tree_size: u64) -> MirrorResult<Vec<Hash>> {
+    store.with_conn(|conn| leaf_hashes_for_conn(conn, tree_size))
 }
 
 /// Build the best-effort entry prefix a governance resolution can use: canonical storage,
@@ -335,15 +385,20 @@ fn build_visible_prefix(
 ///    key (core spec §7.3, §6.5). Only once this passes is `cp.root_hash` treated as
 ///    authenticated.
 /// 3. Commit every entry in `entries_to_promote` for real (each re-verified by
-///    [`crate::ingest::promote_entry`] against canonical storage).
-/// 4. If the full range is *already* canonical after step 3, opportunistically confirm the
-///    root recomputes, rejecting outright on a clear mismatch — a checkpoint whose root
-///    provably disagrees with entries this mirror already holds is never even recorded as
-///    authenticated.
-/// 5. Record `cp` as authenticated (core spec §7.3, §5.2.2 item 4: append-only in
+///    [`crate::ingest::promote_entry_in`] against canonical storage) and, if the full range is
+///    *already* canonical afterward, opportunistically confirm the root recomputes, rejecting
+///    outright on a clear mismatch — a checkpoint whose root provably disagrees with entries
+///    this mirror already holds is never even recorded as authenticated.
+/// 4. Record `cp` as authenticated (core spec §7.3, §5.2.2 item 4: append-only in
 ///    publication; a `(tree_size, checkpoint_time)` already present with different content
 ///    is rejected, but a different `checkpoint_time` at the same `tree_size` is a legitimate
 ///    additional member — see [`crate::store::Store::insert_checkpoint`]).
+///
+/// Steps 3 and 4 run inside one `SQLite` transaction (the crate-private
+/// `Store::with_transaction`): a batch
+/// that fails partway — a bad proof on the third of five `entries_to_promote`, say — leaves
+/// the store exactly as it was before the call, never partially promoted. Steps 1 and 2 are
+/// read-only (governance resolution, signature verification) and need no such wrapping.
 ///
 /// Series-usability is **not** decided here: it is computed on demand from the full current
 /// state by [`series_view`], since entries (and other checkpoints) can arrive after `cp`
@@ -368,24 +423,26 @@ pub fn ingest_checkpoint(
     let key = governance.resolve_log_key(&cp.key_id, cp.tree_size)?;
     verify_checkpoint_signature(cp, raw, &config.log_id, key)?;
 
-    for pending in entries_to_promote {
-        crate::ingest::promote_entry(
-            store,
-            cp,
-            &pending.entry_id,
-            pending.leaf_index,
-            &pending.inclusion_path,
-        )?;
-    }
-
-    if let Ok(leaf_hashes) = leaf_hashes_for(store, cp.tree_size) {
-        if compute_root(&leaf_hashes) != claimed_root {
-            return Err(MirrorError::CheckpointRootMismatch { tree_size: cp.tree_size });
+    store.with_transaction(|conn| {
+        for pending in entries_to_promote {
+            crate::ingest::promote_entry_in(
+                conn,
+                cp,
+                &pending.entry_id,
+                pending.leaf_index,
+                &pending.inclusion_path,
+            )?;
         }
-    }
 
-    store.insert_checkpoint(cp)?;
-    Ok(())
+        if let Ok(leaf_hashes) = leaf_hashes_for_conn(conn, cp.tree_size) {
+            if compute_root(&leaf_hashes) != claimed_root {
+                return Err(MirrorError::CheckpointRootMismatch { tree_size: cp.tree_size });
+            }
+        }
+
+        crate::store::insert_checkpoint_raw(conn, cp)?;
+        Ok(())
+    })
 }
 
 /// Resolve governance for `tree_size` from canonical storage alone, treating an unresolvable
@@ -422,12 +479,39 @@ struct GapFreeResult {
 }
 
 /// Compute the gap-free frontier and its stop reason over an already-ordered series-usable
-/// slice (core spec §7.3).
+/// slice, per core spec §7.3's "Series completeness" and "Which version governs" paragraphs,
+/// quoted here verbatim because they are normative rather than an inferred reading:
 ///
-/// The range must begin at `cadence_epoch` or at a checkpoint whose predecessor is the
-/// genesis state; every interval is judged by the cadence in force when it began (the
-/// earlier member's governing version); `checkpoint_time` MUST be non-decreasing, a decrease
-/// is a violation, never a zero-length gap.
+/// - "A published checkpoint series is **gap-free over a range** iff, within that range:
+///   every adjacent pair satisfies the cadence rule above; `checkpoint_time` is non-decreasing
+///   across the series (a decreasing time is a violation and a finding, never a zero-length
+///   gap); and the range begins at `cadence_epoch` — the single start of the obligation,
+///   judged under the genesis manifest version's cadence since no earlier version exists to
+///   govern it. The epoch is not free-floating: the earliest checkpoint committing the genesis
+///   manifest MUST carry a `checkpoint_time` that is at or after `cadence_epoch` and no later
+///   than `cadence_epoch` plus that version's `checkpoint_cadence`. An epoch preceding that
+///   window would reach back over an interval the corpus did not exist for; an epoch following
+///   it would leave the corpus's opening interval unjudged. (A corpus's *genesis checkpoint* —
+///   the checkpoint whose `tree_size` equals the genesis manifest's entry index plus one — need
+///   not be published, and is not a start point.)";
+/// - "A gap that straddles a cadence change is judged under the version governing its
+///   **earlier** member, so every interval is judged by the cadence in force when it began.";
+/// - "members sharing a `tree_size` MUST carry the same `root_hash`" (the ordering paragraph;
+///   see [`SeriesView::root_divergences`], computed separately in [`series_view`], since it
+///   applies to authenticated members generally, not only the series-usable subset this
+///   function walks).
+///
+/// "`checkpoint_cadence` values are compared by normalized value, not by spelling: `PT60M` and
+/// `PT1H` are the same cadence. A later manifest version repeating `cadence_epoch` repeats it
+/// by value." — [`crate::manifest::GovernanceState`] already stores every duration and
+/// timestamp field as parsed nanoseconds, so every comparison below is a plain `u64`
+/// comparison, never a string comparison.
+///
+/// `usable`'s first member is, by construction, always the earliest series-usable checkpoint
+/// committing the genesis manifest: governance resolves at `first.tree_size` only if the
+/// genesis manifest entry lies within `[0, first.tree_size)`, so `genesis_entry_index + 1 <=
+/// first.tree_size` always holds, and `usable` is ascending, so no earlier series-usable
+/// member could also commit it.
 fn compute_gap_free_frontier(
     store: &Store,
     config: &Config,
@@ -456,11 +540,15 @@ fn compute_gap_free_frontier(
     let epoch_nanos = genesis_governance.cadence_epoch_nanos();
     let genesis_cadence_nanos = genesis_governance.cadence_nanos();
 
+    // The series' one and only start: `first` (the earliest checkpoint committing the genesis
+    // manifest, among series-usable members) MUST fall within the genesis version's cadence
+    // window of `cadence_epoch` — core spec §7.3. Neither earlier (reaching back over an
+    // interval the corpus did not exist for) nor later (leaving the opening interval
+    // unjudged) is valid; the genesis checkpoint's `tree_size` plays no role in this check.
     let first_time = parse_checkpoint_time(&first.checkpoint_time)?;
-    let starts_at_genesis_state = first.tree_size == genesis_entry_index + 1;
-    let starts_at_epoch =
+    let starts_within_epoch_window =
         first_time >= epoch_nanos && first_time - epoch_nanos <= genesis_cadence_nanos;
-    if !starts_at_genesis_state && !starts_at_epoch {
+    if !starts_within_epoch_window {
         return Ok(GapFreeResult { frontier: None, stop: Some(FrontierStop::NoValidStart) });
     }
 
@@ -547,12 +635,20 @@ pub fn series_view(store: &Store, config: &Config) -> MirrorResult<SeriesView> {
         .collect();
     let GapFreeResult { frontier: gap_free_frontier, stop: frontier_stop } =
         compute_gap_free_frontier(store, config, &usable_checkpoints)?;
+    let root_divergences = find_root_divergences(&all);
 
-    Ok(SeriesView { members, gap_free_frontier, frontier_stop })
+    Ok(SeriesView { members, gap_free_frontier, frontier_stop, root_divergences })
 }
 
 /// `ITUB(index)`: the series-usable checkpoint with the smallest `tree_size > index`, but
 /// only if it falls within `view`'s gap-free frontier (core spec §7.3, §5.2.1-§5.2.2).
+///
+/// Where that `tree_size` carries several series-usable members (a quiet log republishing at
+/// unchanged `tree_size`), the one with the **earliest** `checkpoint_time` governs — the
+/// tightest bound the series supports (core spec §7.3). `view.members` is already ordered
+/// `(tree_size, checkpoint_time)` ascending (see the module docs), so the first match
+/// `.find()` reaches is exactly that member; this function does not re-sort or otherwise
+/// select among ties itself.
 ///
 /// Returns `None` — unavailable, never a computed value — if no covering member exists, or
 /// if the series is not proven gap-free that far. Pairwise consistency between the members
@@ -1208,5 +1304,163 @@ mod tests {
         let view = series_view(&fx.store, &fx.config).expect("view");
         assert_eq!(view.gap_free_frontier, Some(1));
         assert_eq!(view.frontier_stop, Some(FrontierStop::CadenceExceeded { after_tree_size: 1 }));
+    }
+
+    // ---- round 4.5 (commit 9962750): the series has exactly one start, `cadence_epoch` ----
+
+    #[test]
+    fn a_checkpoint_at_the_genesis_checkpoint_size_outside_the_epoch_window_does_not_start_the_series(
+    ) {
+        // Core spec §7.3: "the genesis checkpoint is no longer an alternative start point —
+        // it need never have been published, so it cannot anchor anything." This checkpoint
+        // sits exactly at the genesis checkpoint's `tree_size` (genesis_entry_index + 1 = 1),
+        // which the now-superseded reading of the spec would have accepted regardless of
+        // `checkpoint_time`. Under the current text, only the epoch window matters, and this
+        // checkpoint's time (one hour after epoch, cadence five minutes) falls well outside it.
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"86".repeat(32)).expect("seed");
+        let fx = fixture(&log_key, "2026-01-01T00:00:00Z"); // genesis cadence: 5 minutes
+        let leaves = [log_leaf_hash(&fx.store.get_entries_range(0, 1).expect("range")[0])];
+        let root = compute_root(&leaves);
+        let cp =
+            checkpoint_for(&log_key, &fx.config.log_id, 1, root, "2026-01-01T01:00:00.000000000Z");
+
+        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[])
+            .expect("authentication does not require a valid series start");
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert_eq!(view.members[0].state, CheckpointState::SeriesUsable);
+        assert_eq!(view.gap_free_frontier, None);
+        assert_eq!(view.frontier_stop, Some(FrontierStop::NoValidStart));
+    }
+
+    #[test]
+    fn the_series_may_start_at_any_series_usable_member_within_the_epoch_window_not_only_the_genesis_checkpoint(
+    ) {
+        // Core spec §7.3: the genesis checkpoint "need not be published, and is not a start
+        // point." Here no checkpoint is ever published at tree_size 1 (the genesis checkpoint
+        // size); the series starts directly at tree_size 2, whose checkpoint_time still falls
+        // within the genesis version's cadence window of `cadence_epoch`.
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"87".repeat(32)).expect("seed");
+        let fx = fixture(&log_key, "2026-01-01T00:00:00Z"); // genesis cadence: 5 minutes
+        let genesis_leaf = log_leaf_hash(&fx.store.get_entries_range(0, 1).expect("range")[0]);
+
+        let second = stored_entry(serde_json::json!({ "n": 1 }), &fx.producer);
+        let root = compute_root(&[genesis_leaf, log_leaf_hash(&second)]);
+        stage_and_promote_at(&fx.store, 2, root, &[second], 1);
+        let cp =
+            checkpoint_for(&log_key, &fx.config.log_id, 2, root, "2026-01-01T00:01:00.000000000Z");
+        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[])
+            .expect("admits: the genesis checkpoint itself was never published");
+
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert_eq!(view.gap_free_frontier, Some(2));
+        assert_eq!(view.frontier_stop, None);
+    }
+
+    #[test]
+    fn checkpoints_sharing_a_tree_size_with_different_roots_are_a_root_divergence_finding() {
+        // Core spec §7.3: "members sharing a `tree_size` MUST carry the same `root_hash`; a
+        // divergent root at equal size is a finding." Neither checkpoint's full range is held
+        // yet (only the genesis entry exists), so the opportunistic root-mismatch check in
+        // `ingest_checkpoint` cannot catch a bad root at admission time — both are merely
+        // authenticated, which is exactly the situation a purely-metadata divergence check
+        // exists for.
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"88".repeat(32)).expect("seed");
+        let fx = fixture(&log_key, "2026-01-01T00:00:00Z");
+        let cp_a = checkpoint_for(
+            &log_key,
+            &fx.config.log_id,
+            2,
+            [0x01u8; 32],
+            "2026-01-01T00:01:00.000000000Z",
+        );
+        let cp_b = checkpoint_for(
+            &log_key,
+            &fx.config.log_id,
+            2,
+            [0x02u8; 32],
+            "2026-01-01T00:02:00.000000000Z",
+        );
+        ingest_checkpoint(&fx.store, &fx.config, &cp_a, None, &[])
+            .expect("admits: entries not yet complete for tree_size 2");
+        ingest_checkpoint(&fx.store, &fx.config, &cp_b, None, &[])
+            .expect("admits: same reason, and a different checkpoint_time avoids the series-member conflict check");
+
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert_eq!(view.root_divergences, vec![2]);
+    }
+
+    // ---- round 4: batch checkpoint admission is transactional ----
+
+    #[test]
+    fn a_batch_failing_on_its_last_entry_leaves_the_store_byte_identical() {
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"89".repeat(32)).expect("seed");
+        let fx = fixture(&log_key, "2026-01-01T00:00:00Z");
+        let genesis_leaf = log_leaf_hash(&fx.store.get_entries_range(0, 1).expect("range")[0]);
+
+        let e1 = stored_entry(serde_json::json!({ "n": 1 }), &fx.producer);
+        let e2 = stored_entry(serde_json::json!({ "n": 2 }), &fx.producer);
+        let e3 = stored_entry(serde_json::json!({ "n": 3 }), &fx.producer);
+        let leaves = [genesis_leaf, log_leaf_hash(&e1), log_leaf_hash(&e2), log_leaf_hash(&e3)];
+        let root = compute_root(&leaves);
+        let cp =
+            checkpoint_for(&log_key, &fx.config.log_id, 4, root, "2026-01-01T00:01:00.000000000Z");
+
+        fx.store.stage_entry(&entry_id_of(&e1), &e1).expect("stage e1");
+        fx.store.stage_entry(&entry_id_of(&e2), &e2).expect("stage e2");
+        fx.store.stage_entry(&entry_id_of(&e3), &e3).expect("stage e3");
+
+        let proof_for = |index: u64| {
+            let proof = atl_core::core::merkle::generate_inclusion_proof(index, 4, |level, at| {
+                if level == 0 {
+                    leaves.get(usize::try_from(at).ok()?).copied()
+                } else {
+                    None
+                }
+            })
+            .expect("index within tree");
+            ahl_core::proof_path_hex(&proof)
+        };
+
+        let pending = vec![
+            PendingPromotion {
+                entry_id: entry_id_of(&e1),
+                leaf_index: 1,
+                inclusion_path: proof_for(1),
+            },
+            PendingPromotion {
+                entry_id: entry_id_of(&e2),
+                leaf_index: 2,
+                inclusion_path: proof_for(2),
+            },
+            // The batch's LAST item: it claims the SAME position as e2 above. Because e2's
+            // pending entry lists first and genuinely fills that slot, `build_visible_prefix`
+            // treats this one as an already-filled, uninspected duplicate and never checks its
+            // proof (see its docs: "already canonical; a tentative duplicate is not
+            // consulted") — so nothing catches this before the transaction opens. Only inside
+            // it, when `promote_entry_in` genuinely tries to promote e3 at e2's position, does
+            // e3's proof fail to open the root (it was built for e2's leaf, not e3's) — after
+            // e1 and e2 have already been promoted within that same, still-uncommitted
+            // transaction.
+            PendingPromotion {
+                entry_id: entry_id_of(&e3),
+                leaf_index: 2,
+                inclusion_path: proof_for(2),
+            },
+        ];
+
+        let next_index_before = fx.store.next_index().expect("query");
+        let entries_before = fx.store.get_entries_range(0, next_index_before).expect("query");
+        let checkpoints_before = fx.store.all_checkpoints().expect("query");
+
+        let result = ingest_checkpoint(&fx.store, &fx.config, &cp, None, &pending);
+        assert!(result.is_err(), "e3's proof, built for e2's leaf, must not open the root");
+
+        assert_eq!(fx.store.next_index().expect("query"), next_index_before);
+        assert_eq!(
+            fx.store.get_entries_range(0, next_index_before).expect("query"),
+            entries_before,
+            "e1 and e2, promoted earlier in the same failed transaction, must not persist"
+        );
+        assert_eq!(fx.store.all_checkpoints().expect("query"), checkpoints_before);
     }
 }

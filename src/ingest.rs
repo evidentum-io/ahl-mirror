@@ -82,6 +82,32 @@ pub fn stage_entry(
     store.stage_entry(&computed_id, bytes)
 }
 
+/// Verify a Merkle inclusion proof of `bytes`' log leaf at `leaf_index`, under a tree of
+/// `tree_size` with root `root` (adaptor profile §8.2).
+///
+/// A pure check: it neither reads nor writes the store, and does not require `root` to have
+/// been authenticated — it only establishes "if this root is genuine, these bytes truly sit
+/// at this position", which is safe to evaluate before that root's signature has been
+/// checked (see [`crate::checkpoint::ingest_checkpoint`], which relies on exactly that to
+/// resolve governance material from entries not yet committed).
+///
+/// # Errors
+///
+/// A parsing error if `inclusion_path` is malformed, or [`MirrorError::Atl`] if the
+/// underlying Merkle verification cannot run. A structurally valid proof that simply does
+/// not open the root yields `Ok(false)`, not an error.
+pub fn verify_inclusion_for(
+    bytes: &[u8],
+    leaf_index: u64,
+    tree_size: u64,
+    inclusion_path: &[String],
+    root: &Hash,
+) -> MirrorResult<bool> {
+    let leaf: Hash = log_leaf_hash(bytes);
+    let proof = ahl_core::proof_from_hex(leaf_index, tree_size, inclusion_path)?;
+    Ok(verify_inclusion(&leaf, &proof, root)?)
+}
+
 /// Promote a staged entry to canonical storage, given a Merkle inclusion proof of its log
 /// leaf under `checkpoint` (adaptor profile §8.2).
 ///
@@ -108,11 +134,8 @@ pub fn promote_entry(
         .get_staged(entry_id)?
         .ok_or_else(|| MirrorError::NotStaged { entry_id: entry_id.to_owned() })?;
 
-    let leaf: Hash = log_leaf_hash(&bytes);
     let root: Hash = ahl_core::parse_hash_hex(&checkpoint.root_hash)?;
-    let proof = ahl_core::proof_from_hex(leaf_index, checkpoint.tree_size, inclusion_path)?;
-
-    if !verify_inclusion(&leaf, &proof, &root)? {
+    if !verify_inclusion_for(&bytes, leaf_index, checkpoint.tree_size, inclusion_path, &root)? {
         return Err(MirrorError::InclusionProofInvalid {
             entry_id: entry_id.to_owned(),
             leaf_index,

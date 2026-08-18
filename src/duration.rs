@@ -14,6 +14,14 @@
 //! The alternative `PnW` (weeks) form ISO 8601 also permits is outside the grammar core spec
 //! §7.3 gives (`P[n]DT[n]H[n]M[n]S` has no `W`) and is rejected the same way any other
 //! unrecognised trailing content is: as [`crate::error::MirrorError::BadDuration`].
+//!
+//! Fractional seconds MAY carry **at most nine digits**; core spec §7.3 requires anything
+//! longer to be rejected outright — never truncated or rounded to nine — since either would
+//! make the parsed value implementation-dependent (see
+//! [`crate::error::MirrorError::DurationFractionTooLong`]). `checkpoint_cadence` additionally
+//! MUST be greater than zero (see [`parse_checkpoint_cadence_nanos`]); this crate does not
+//! impose the same floor on `witness_grace_period`, since core spec §7.3 states it only for
+//! `checkpoint_cadence`.
 
 use crate::error::{MirrorError, MirrorResult};
 
@@ -92,8 +100,15 @@ pub fn parse_iso8601_duration_nanos(value: &str) -> MirrorResult<u64> {
                     if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
                         return Err(bad());
                     }
+                    if f.len() > 9 {
+                        return Err(MirrorError::DurationFractionTooLong {
+                            value: value.to_owned(),
+                        });
+                    }
+                    // Fewer than nine digits pads with trailing zeros, which is exact — not
+                    // truncation — since a shorter decimal expansion implies exactly-zero
+                    // digits beyond what was written (`0.5S` is exactly `500_000_000` ns).
                     let mut digits = f.to_owned();
-                    digits.truncate(9);
                     while digits.len() < 9 {
                         digits.push('0');
                     }
@@ -115,6 +130,21 @@ pub fn parse_iso8601_duration_nanos(value: &str) -> MirrorResult<u64> {
         .checked_mul(NANOS_PER_SECOND)
         .and_then(|n| n.checked_add(extra_nanos))
         .ok_or_else(bad)
+}
+
+/// Parse a `checkpoint_cadence` value: [`parse_iso8601_duration_nanos`], plus core spec
+/// §7.3's additional requirement that it be greater than zero.
+///
+/// # Errors
+///
+/// Whatever [`parse_iso8601_duration_nanos`] returns, or
+/// [`MirrorError::NonPositiveCadence`] if `value` parses but to exactly zero nanoseconds.
+pub fn parse_checkpoint_cadence_nanos(value: &str) -> MirrorResult<u64> {
+    let nanos = parse_iso8601_duration_nanos(value)?;
+    if nanos == 0 {
+        return Err(MirrorError::NonPositiveCadence { value: value.to_owned() });
+    }
+    Ok(nanos)
 }
 
 /// Consume a leading `"<digits><unit>"` component from `input`, if the next unit character
@@ -151,6 +181,28 @@ mod tests {
     fn fractional_seconds_are_honoured() {
         assert_eq!(parse_iso8601_duration_nanos("PT0.5S").expect("valid"), 500_000_000);
         assert_eq!(parse_iso8601_duration_nanos("PT1.000000001S").expect("valid"), 1_000_000_001);
+        // Exactly nine digits: the maximum core spec §7.3 allows, still accepted exactly.
+        assert_eq!(
+            parse_iso8601_duration_nanos("PT1.123456789S").expect("nine digits is the max"),
+            1_123_456_789
+        );
+    }
+
+    #[test]
+    fn a_tenth_fractional_digit_is_rejected_not_truncated() {
+        // Core spec §7.3: "at most nine digits; a value with more is malformed and MUST be
+        // rejected, never truncated or rounded." Both worked examples from the spec: silently
+        // truncating would make `PT0.0000000009S` collapse to zero and `PT1.0000000009S`
+        // collapse to exactly one second — an implementation-dependent loss the rejection
+        // rule exists to foreclose.
+        assert!(matches!(
+            parse_iso8601_duration_nanos("PT0.0000000009S"),
+            Err(MirrorError::DurationFractionTooLong { .. })
+        ));
+        assert!(matches!(
+            parse_iso8601_duration_nanos("PT1.0000000009S"),
+            Err(MirrorError::DurationFractionTooLong { .. })
+        ));
     }
 
     #[test]
@@ -202,6 +254,40 @@ mod tests {
         assert!(matches!(
             parse_iso8601_duration_nanos("P1Y2D"),
             Err(MirrorError::ProhibitedDurationComponent { component: 'Y', .. })
+        ));
+    }
+
+    #[test]
+    fn checkpoint_cadence_must_be_greater_than_zero() {
+        // Core spec §7.3: `checkpoint_cadence` MUST be greater than zero.
+        assert!(matches!(
+            parse_checkpoint_cadence_nanos("PT0S"),
+            Err(MirrorError::NonPositiveCadence { .. })
+        ));
+        // Every component present but each individually (and jointly) zero still nets to
+        // zero nanoseconds — the check is on the parsed total, not the literal spelling.
+        assert!(matches!(
+            parse_checkpoint_cadence_nanos("P0DT0H0M0S"),
+            Err(MirrorError::NonPositiveCadence { .. })
+        ));
+    }
+
+    #[test]
+    fn a_positive_checkpoint_cadence_parses_normally() {
+        assert_eq!(parse_checkpoint_cadence_nanos("PT5M").expect("positive"), 300_000_000_000);
+    }
+
+    #[test]
+    fn checkpoint_cadence_parsing_still_propagates_ordinary_duration_errors() {
+        // The zero-check is additional, not a replacement for the underlying grammar and
+        // prohibited-component checks.
+        assert!(matches!(
+            parse_checkpoint_cadence_nanos("P1Y"),
+            Err(MirrorError::ProhibitedDurationComponent { component: 'Y', .. })
+        ));
+        assert!(matches!(
+            parse_checkpoint_cadence_nanos("not-a-duration"),
+            Err(MirrorError::BadDuration { .. })
         ));
     }
 }

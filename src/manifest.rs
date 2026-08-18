@@ -40,7 +40,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::config::{Config, KeyObjectSpec, ResolvedKeyObject};
-use crate::duration::parse_iso8601_duration_nanos;
+use crate::duration::{parse_checkpoint_cadence_nanos, parse_iso8601_duration_nanos};
 use crate::error::{MirrorError, MirrorResult};
 
 #[derive(Debug, Deserialize)]
@@ -191,7 +191,11 @@ fn parse_governance(
     if log_block.log_id != log_id {
         return None;
     }
-    let cadence_nanos = parse_iso8601_duration_nanos(&log_block.checkpoint_cadence).ok()?;
+    // `parse_checkpoint_cadence_nanos`, not the bare duration parser: core spec §7.3 requires
+    // `checkpoint_cadence` to be greater than zero, on top of the ordinary duration grammar —
+    // a manifest declaring a zero cadence is malformed and simply is not governance, exactly
+    // like any other schema defect this function returns `None` for.
+    let cadence_nanos = parse_checkpoint_cadence_nanos(&log_block.checkpoint_cadence).ok()?;
     // Required present and parseable, though this crate does not otherwise act on it.
     let _witness_grace_period =
         parse_iso8601_duration_nanos(&log_block.witness_grace_period).ok()?;
@@ -603,5 +607,33 @@ mod tests {
         let state = resolve(&entries, &config).expect("chain resolves");
         assert_eq!(state.governing_manifest_entry_index(), 2);
         assert!(state.resolve_log_key(&rotated_log_key.key_id(), 2).is_ok());
+    }
+
+    #[test]
+    fn a_genesis_manifest_declaring_a_zero_cadence_is_not_governance() {
+        // Core spec §7.3: `checkpoint_cadence` MUST be greater than zero. A manifest
+        // declaring `PT0S` is malformed, exactly like a missing field or a bad signature —
+        // simply never becomes governance, rather than being accepted with a degenerate
+        // cadence.
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"14".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"15".repeat(32)).expect("seed");
+        let payload = json!({
+            "type": "manifest",
+            "producer": "producer-1",
+            "keys": producer_key_array(&producer),
+            "log": log_block(
+                "sha256:aa", "PT0S", "2026-01-01T00:00:00Z", &producer_key_array(&log_key)
+            ),
+        });
+        let genesis_env = ahl_core::envelope(payload, &producer);
+        let genesis_id = entry_id_of(&genesis_env);
+        let config = config_with(&producer, &genesis_id);
+        let bytes = ahl_core::jcs(&genesis_env);
+
+        assert!(matches!(
+            resolve(&[bytes], &config),
+            Err(MirrorError::GovernanceChainUnresolvable { .. })
+        ));
     }
 }

@@ -1,16 +1,19 @@
-//! A minimal ISO 8601 duration parser for `checkpoint_cadence` (core spec §7.3).
+//! An ISO 8601 duration parser for `checkpoint_cadence`/`witness_grace_period` (core spec
+//! §7.3).
 //!
-//! # Scope and a reported assumption
+//! Core spec §7.3 restricts these fields to the time-only subset of ISO 8601:
+//! `P[n]DT[n]H[n]M[n]S` — days, hours, minutes, seconds. Years and calendar months are
+//! **PROHIBITED**, normatively, because their length is context-dependent: admitting them
+//! would make cadence, frontier, completeness and incorporation-time-bound computations
+//! implementation-dependent, since two conformant parsers could map the same manifest to
+//! different nanosecond totals. A value carrying `Y`, or `M` in the date part (a calendar
+//! month, as opposed to `M` after `T`, which is minutes), is malformed and MUST be rejected
+//! rather than approximated — this parser does so with a distinct
+//! [`crate::error::MirrorError::ProhibitedDurationComponent`], never silently converting.
 //!
-//! The profile requires `checkpoint_cadence` to be an ISO 8601 duration but does not fix
-//! which subset. This parser accepts the standard `P[n"Y"][n"M"][n"D"]["T"[n"H"][n"M"][n"S"]]`
-//! form and the alternative `P[n"W"]` (weeks) form, both integer-only in the calendar part and
-//! allowing a decimal `S` (fractional seconds). Calendar components — `Y` (years) and `M`
-//! (months) before `T` — have no fixed length in ISO 8601 itself; this parser converts them
-//! using fixed civil-calendar-free approximations (365 days/year, 30 days/month), which is
-//! adequate for cadence values expressed in the smaller units a checkpoint cadence realistically
-//! uses (seconds through days) but not exact for a cadence declared in years or months. Reported
-//! as an implementer's assumption, not a specification quotation.
+//! The alternative `PnW` (weeks) form ISO 8601 also permits is outside the grammar core spec
+//! §7.3 gives (`P[n]DT[n]H[n]M[n]S` has no `W`) and is rejected the same way any other
+//! unrecognised trailing content is: as [`crate::error::MirrorError::BadDuration`].
 
 use crate::error::{MirrorError, MirrorResult};
 
@@ -18,16 +21,16 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 3_600;
 const SECONDS_PER_DAY: u64 = 86_400;
-const SECONDS_PER_WEEK: u64 = 7 * SECONDS_PER_DAY;
-const SECONDS_PER_MONTH_APPROX: u64 = 30 * SECONDS_PER_DAY;
-const SECONDS_PER_YEAR_APPROX: u64 = 365 * SECONDS_PER_DAY;
 
-/// Parse an ISO 8601 duration to a total nanosecond count.
+/// Parse an ISO 8601 duration of the core spec §7.3 time-only subset to a total nanosecond
+/// count.
 ///
 /// # Errors
 ///
-/// Returns [`MirrorError::BadDuration`] if `value` is not a well-formed duration of the
-/// supported subset (see module docs), or if the total overflows `u64` nanoseconds.
+/// Returns [`MirrorError::ProhibitedDurationComponent`] if `value` carries `Y`, or `M` in the
+/// date part (core spec §7.3 forbids both, normatively — see the module docs). Returns
+/// [`MirrorError::BadDuration`] if `value` is otherwise not a well-formed duration of the
+/// `P[n]DT[n]H[n]M[n]S` grammar, or if the total overflows `u64` nanoseconds.
 pub fn parse_iso8601_duration_nanos(value: &str) -> MirrorResult<u64> {
     let bad = || MirrorError::BadDuration { value: value.to_owned() };
     let rest = value.strip_prefix('P').ok_or_else(bad)?;
@@ -35,13 +38,11 @@ pub fn parse_iso8601_duration_nanos(value: &str) -> MirrorResult<u64> {
         return Err(bad());
     }
 
-    // Weeks are an alternative, exclusive form: "P<n>W".
-    if let Some(weeks) = rest.strip_suffix('W') {
-        let weeks: u64 = weeks.parse().map_err(|_| bad())?;
-        return weeks
-            .checked_mul(SECONDS_PER_WEEK)
-            .and_then(|s| s.checked_mul(NANOS_PER_SECOND))
-            .ok_or_else(bad);
+    if rest.contains('Y') {
+        return Err(MirrorError::ProhibitedDurationComponent {
+            value: value.to_owned(),
+            component: 'Y',
+        });
     }
 
     let (date_part, time_part) = match rest.split_once('T') {
@@ -49,17 +50,20 @@ pub fn parse_iso8601_duration_nanos(value: &str) -> MirrorResult<u64> {
         None => (rest, None),
     };
 
+    // A literal `M` in the date part is a calendar month (prohibited); a literal `M` in the
+    // time part, after `T`, is minutes (allowed) — checked only on `date_part` here.
+    if date_part.contains('M') {
+        return Err(MirrorError::ProhibitedDurationComponent {
+            value: value.to_owned(),
+            component: 'M',
+        });
+    }
+
     let mut total_seconds: u64 = 0;
     let mut cursor = date_part;
-    for (unit, seconds_per_unit) in
-        [('Y', SECONDS_PER_YEAR_APPROX), ('M', SECONDS_PER_MONTH_APPROX), ('D', SECONDS_PER_DAY)]
-    {
-        if let Some((n, remainder)) = take_component(cursor, unit)? {
-            total_seconds = total_seconds
-                .checked_add(n.checked_mul(seconds_per_unit).ok_or_else(bad)?)
-                .ok_or_else(bad)?;
-            cursor = remainder;
-        }
+    if let Some((n, remainder)) = take_component(cursor, 'D')? {
+        total_seconds = n.checked_mul(SECONDS_PER_DAY).ok_or_else(bad)?;
+        cursor = remainder;
     }
     if !cursor.is_empty() {
         return Err(bad());
@@ -141,7 +145,6 @@ mod tests {
             parse_iso8601_duration_nanos("P1DT12H").expect("valid"),
             (86_400 + 43_200) * 1_000_000_000
         );
-        assert_eq!(parse_iso8601_duration_nanos("P1W").expect("valid"), 604_800_000_000_000);
     }
 
     #[test]
@@ -159,5 +162,46 @@ mod tests {
         assert!(parse_iso8601_duration_nanos("PT5X").is_err()); // unknown unit
         assert!(parse_iso8601_duration_nanos("P1H").is_err()); // H without T
         assert!(parse_iso8601_duration_nanos("PT1.S").is_err()); // empty fraction
+    }
+
+    #[test]
+    fn weeks_are_outside_the_core_spec_grammar_and_rejected() {
+        // `PnW` is valid ISO 8601 in general, but core spec §7.3's grammar is
+        // `P[n]DT[n]H[n]M[n]S` — no `W` — so this is an ordinary malformed duration, not a
+        // prohibited-component case.
+        assert!(matches!(
+            parse_iso8601_duration_nanos("P1W"),
+            Err(MirrorError::BadDuration { .. })
+        ));
+    }
+
+    #[test]
+    fn years_are_rejected_as_a_prohibited_component_not_approximated() {
+        let err = parse_iso8601_duration_nanos("P1Y").expect_err("years are prohibited");
+        assert!(matches!(err, MirrorError::ProhibitedDurationComponent { component: 'Y', .. }));
+    }
+
+    #[test]
+    fn calendar_months_are_rejected_as_a_prohibited_component_not_approximated() {
+        let err = parse_iso8601_duration_nanos("P1M").expect_err("calendar months are prohibited");
+        assert!(matches!(err, MirrorError::ProhibitedDurationComponent { component: 'M', .. }));
+        // A composite value combining a prohibited calendar month with an allowed day.
+        let err =
+            parse_iso8601_duration_nanos("P1M2D").expect_err("calendar months are prohibited");
+        assert!(matches!(err, MirrorError::ProhibitedDurationComponent { component: 'M', .. }));
+    }
+
+    #[test]
+    fn minutes_after_t_are_not_confused_with_calendar_months() {
+        // `M` after `T` is minutes, not a calendar month, and MUST be accepted.
+        assert_eq!(parse_iso8601_duration_nanos("PT10M").expect("valid"), 600_000_000_000);
+    }
+
+    #[test]
+    fn a_year_component_is_rejected_even_alongside_other_prohibited_or_valid_parts() {
+        assert!(matches!(
+            parse_iso8601_duration_nanos("P1Y2D"),
+            Err(MirrorError::ProhibitedDurationComponent { component: 'Y', .. })
+        ));
     }
 }

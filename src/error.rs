@@ -206,11 +206,25 @@ pub enum MirrorError {
         tree_size: u64,
     },
 
-    /// A duration string is not a well-formed ISO 8601 duration (core spec §7.3 schema).
+    /// A duration string is not a well-formed ISO 8601 duration of the time-only subset core
+    /// spec §7.3 requires (`P[n]DT[n]H[n]M[n]S`).
     #[error("`{value}` is not a valid ISO 8601 duration")]
     BadDuration {
         /// The value as submitted.
         value: String,
+    },
+
+    /// A duration string carries a calendar component (`Y`, or `M` in the date part) core
+    /// spec §7.3 PROHIBITS in `checkpoint_cadence`/`witness_grace_period`, because years and
+    /// calendar months have no fixed length — admitting them would make cadence, frontier,
+    /// completeness and incorporation bounds implementation-dependent. Rejected outright,
+    /// never approximated.
+    #[error("`{value}` carries a prohibited calendar component (`{component}`); core spec §7.3 restricts durations to days/hours/minutes/seconds")]
+    ProhibitedDurationComponent {
+        /// The value as submitted.
+        value: String,
+        /// Which prohibited component was found (`'Y'` or `'M'`).
+        component: char,
     },
 
     /// A `cadence_epoch` value is not a valid RFC 3339 timestamp (core spec §7.3 schema).

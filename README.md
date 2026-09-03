@@ -135,7 +135,16 @@ not needed.
   it is a `key` statement whose producer signature verifies under the producer key set
   currently in force, which then adds or retires a producer key going forward. A statement
   failing its check is simply not governance — skipped, with the walk continuing from the
-  last genuinely verified state — never a reason to abort resolution outright.
+  last genuinely verified state — never a reason to abort resolution outright. The one
+  statement that *does* abort it is one whose signature verifies but whose declared revision
+  this build does not: a `manifest` or `key` statement MUST declare `ahl_version` equal to the
+  revision in force (`ahl_core::AHL_VERSION`, currently `0.4`), and one declaring an earlier
+  revision — or none at all — is refused by name (`UnsupportedStatementVersion`), because
+  revision 0.4 verifies no material issued under an earlier revision (I-D §2.2, §7.1) and
+  skipping it would silently leave the previous governance version in force. The check runs on
+  every candidate whose envelope verifies, before `predecessor`, `action` or any other payload
+  member is read, so an authentic earlier-revision statement cannot slip past it by also
+  failing some later check.
 - **Bootstrap ordering that lets a checkpoint's own range carry the governance it needs to
   verify itself.** Signature verification for a checkpoint happens *after* building a visible
   entry prefix that overlays canonical storage with any `entries_to_promote` whose inclusion

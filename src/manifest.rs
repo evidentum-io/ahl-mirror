@@ -222,6 +222,40 @@ fn parse_governance(
     })
 }
 
+/// Check a governance statement's declared revision before its content is read.
+///
+/// I-D §7.5 step 1 orders the read "version first, then parse", and §2.2 fixes what the read
+/// decides: this revision verifies no material issued under an earlier one. Called only once a
+/// statement's producer signature has verified under the key set in force, so that an entry
+/// anyone can append cannot abort a walk merely by carrying `type: "manifest"` and an old
+/// `ahl_version`.
+///
+/// # Errors
+///
+/// [`MirrorError::UnsupportedStatementVersion`] if the statement declares an `ahl_version`
+/// other than [`ahl_core::AHL_VERSION`], or declares none.
+fn check_statement_version(payload: &Value, entry_index: u64) -> MirrorResult<()> {
+    let declared = payload.get("ahl_version").and_then(Value::as_str);
+    if declared == Some(ahl_core::AHL_VERSION) {
+        return Ok(());
+    }
+    Err(MirrorError::UnsupportedStatementVersion {
+        entry_index,
+        declared: declared.map(ToOwned::to_owned),
+        expected: ahl_core::AHL_VERSION,
+    })
+}
+
+/// Evaluate one `manifest` entry against the governance state reached so far.
+///
+/// Order is fixed and load-bearing: select the candidate by identity (the anchored genesis
+/// entry id, or nothing for a successor), authenticate it under the key set in force, check the
+/// declared revision, and only then read `predecessor` or any other payload semantics. Reading
+/// semantics earlier would let a malformed or non-successor statement return "candidate
+/// ignored" before the revision gate ran, so an authentic statement from an earlier revision
+/// would leave the previous governance version in force and the walk would report success.
+/// An envelope that does not verify stays "candidate ignored": bytes anyone can append must
+/// not abort resolution.
 fn try_apply_manifest(
     state: &mut Option<GovernanceState>,
     envelope: &Value,
@@ -235,25 +269,27 @@ fn try_apply_manifest(
             if entry_id != config.genesis_manifest_entry_id {
                 return Ok(());
             }
-            if payload.get("predecessor").is_some() {
-                return Ok(()); // predecessor is forbidden for genesis
-            }
             let resolve = resolver_from_slice(&config.genesis_producer_keys, entry_index);
             if !ahl_core::verify_envelope(envelope, resolve)? {
                 return Ok(());
+            }
+            check_statement_version(payload, entry_index)?;
+            if payload.get("predecessor").is_some() {
+                return Ok(()); // predecessor is forbidden for genesis
             }
             *state =
                 parse_governance(payload, entry_index, entry_id, &config.log_id, entry_index, None);
         }
         Some(current) => {
+            let resolve = resolver_from_map(&current.producer_keys, entry_index);
+            if !ahl_core::verify_envelope(envelope, resolve)? {
+                return Ok(());
+            }
+            check_statement_version(payload, entry_index)?;
             let Some(predecessor) = payload.get("predecessor").and_then(Value::as_str) else {
                 return Ok(());
             };
             if predecessor != current.governing_manifest_entry_id {
-                return Ok(());
-            }
-            let resolve = resolver_from_map(&current.producer_keys, entry_index);
-            if !ahl_core::verify_envelope(envelope, resolve)? {
                 return Ok(());
             }
             let next = parse_governance(
@@ -272,22 +308,29 @@ fn try_apply_manifest(
     Ok(())
 }
 
+/// Evaluate one `key` entry against the governance state reached so far.
+///
+/// Same fixed order as [`try_apply_manifest`]: authenticate under the producer key set in
+/// force, check the declared revision, and only then read `action` and `key`. Reading them
+/// first would let an authentic earlier-revision statement that merely omits `action` — or
+/// carries an unparsable key object — be skipped instead of refused.
 fn try_apply_key(
     state: &mut GovernanceState,
     envelope: &Value,
     payload: &Value,
     entry_index: u64,
 ) -> MirrorResult<()> {
+    let resolve = resolver_from_map(&state.producer_keys, entry_index);
+    if !ahl_core::verify_envelope(envelope, resolve)? {
+        return Ok(());
+    }
+    check_statement_version(payload, entry_index)?;
+
     let Some(action) = payload.get("action").and_then(Value::as_str) else { return Ok(()) };
     let Some(key_value) = payload.get("key") else { return Ok(()) };
     let Ok(key_spec) = serde_json::from_value::<KeyObjectSpec>(key_value.clone()) else {
         return Ok(());
     };
-
-    let resolve = resolver_from_map(&state.producer_keys, entry_index);
-    if !ahl_core::verify_envelope(envelope, resolve)? {
-        return Ok(());
-    }
 
     match action {
         "add" => {
@@ -379,6 +422,7 @@ mod tests {
     ) -> Value {
         let payload = json!({
             "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
             "producer": "producer-1",
             "keys": producer_keys,
             "log": log_block(log_id, "PT5M", epoch, log_keys),
@@ -461,6 +505,7 @@ mod tests {
             ahl_core::TestKey::from_seed_hex("log-2", &"08".repeat(32)).expect("seed");
         let bad_next_payload = json!({
             "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
             "producer": "producer-1",
             "predecessor": "sha256:not-the-genesis-entry-id",
             "keys": producer_key_array(&producer),
@@ -496,6 +541,7 @@ mod tests {
             ahl_core::TestKey::from_seed_hex("log-2", &"0b".repeat(32)).expect("seed");
         let next_payload = json!({
             "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
             "producer": "producer-1",
             "predecessor": genesis_id,
             "keys": producer_key_array(&producer),
@@ -531,6 +577,7 @@ mod tests {
             ahl_core::TestKey::from_seed_hex("log-2", &"0e".repeat(32)).expect("seed");
         let next_payload = json!({
             "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
             "producer": "producer-1",
             "predecessor": genesis_id,
             "keys": producer_key_array(&producer),
@@ -581,6 +628,7 @@ mod tests {
         // A `key` statement adds producer_2, signed by the currently-valid producer.
         let key_payload = json!({
             "type": "key",
+            "ahl_version": ahl_core::AHL_VERSION,
             "action": "add",
             "key": {
                 "key_id": producer_2.key_id(), "pubkey": producer_2.pubkey(), "valid_from_index": 1
@@ -593,6 +641,7 @@ mod tests {
             ahl_core::TestKey::from_seed_hex("log-2", &"13".repeat(32)).expect("seed");
         let next_payload = json!({
             "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
             "producer": "producer-1",
             "predecessor": genesis_id,
             "keys": producer_key_array(&producer),
@@ -620,6 +669,7 @@ mod tests {
         let log_key = ahl_core::TestKey::from_seed_hex("log", &"15".repeat(32)).expect("seed");
         let payload = json!({
             "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
             "producer": "producer-1",
             "keys": producer_key_array(&producer),
             "log": log_block(
@@ -635,5 +685,393 @@ mod tests {
             resolve(&[bytes], &config),
             Err(MirrorError::GovernanceChainUnresolvable { .. })
         ));
+    }
+
+    /// Revision 0.4 verifies no material issued under an earlier revision (I-D §2.2, §7.1).
+    ///
+    /// This genesis manifest is authentic in every other respect: it is the entry id the
+    /// config names, it carries no `predecessor`, and its signature is a well-formed 0.4-shape
+    /// entry that verifies under the config's genesis producer key. It declares
+    /// `ahl_version: "0.3"`. Governance resolution refuses it and names the declared revision
+    /// — it is neither accepted as governance nor skipped the way an unverified candidate is.
+    /// The control at the end re-runs the identical fixture with the declared revision changed
+    /// to [`ahl_core::AHL_VERSION`] and nothing else changed, so the refusal is attributable to
+    /// the declared revision alone rather than to any other property of the fixture.
+    #[test]
+    fn a_genesis_manifest_declaring_an_earlier_revision_is_refused() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"20".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"21".repeat(32)).expect("seed");
+        let payload_at = |version: &str| {
+            json!({
+                "type": "manifest",
+                "ahl_version": version,
+                "producer": "producer-1",
+                "keys": producer_key_array(&producer),
+                "log": log_block(
+                    "sha256:aa", "PT5M", "2026-01-01T00:00:00Z",
+                    &producer_key_array(&log_key)
+                ),
+            })
+        };
+
+        let legacy_env = ahl_core::envelope(payload_at("0.3"), &producer);
+        let legacy_config = config_with(&producer, &entry_id_of(&legacy_env));
+        let error = resolve(&[ahl_core::jcs(&legacy_env)], &legacy_config)
+            .expect_err("a genesis declaring 0.3 is refused");
+        assert!(
+            matches!(
+                &error,
+                MirrorError::UnsupportedStatementVersion {
+                    entry_index: 0,
+                    declared: Some(declared),
+                    expected,
+                } if declared == "0.3" && *expected == ahl_core::AHL_VERSION
+            ),
+            "expected a refusal naming the declared revision, got: {error}"
+        );
+
+        // Control: the same fixture differing only in the declared revision.
+        let current_env = ahl_core::envelope(payload_at(ahl_core::AHL_VERSION), &producer);
+        let current_config = config_with(&producer, &entry_id_of(&current_env));
+        let state = resolve(&[ahl_core::jcs(&current_env)], &current_config)
+            .expect("the same genesis at the current revision resolves");
+        assert_eq!(state.governing_manifest_entry_index(), 0);
+    }
+
+    /// Revision 0.4 verifies no material issued under an earlier revision (I-D §2.2, §7.1).
+    ///
+    /// The successor manifest here is built exactly like the one in
+    /// `a_valid_rotation_replaces_the_log_key_set_and_keeps_the_epoch` — correct `predecessor`,
+    /// a signature that verifies under the producer key set the genesis put in force — and
+    /// differs only in declaring `ahl_version: "0.3"`. It is refused rather than ignored:
+    /// ignoring it would leave the genesis governance in force and report success, which is a
+    /// ruling on material this revision has no rules for.
+    #[test]
+    fn a_later_manifest_declaring_an_earlier_revision_is_refused() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"22".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"23".repeat(32)).expect("seed");
+        let genesis_env = genesis_manifest(
+            &producer,
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
+        );
+        let genesis_id = entry_id_of(&genesis_env);
+        let config = config_with(&producer, &genesis_id);
+
+        let rotated_log_key =
+            ahl_core::TestKey::from_seed_hex("log-2", &"24".repeat(32)).expect("seed");
+        let next_payload = json!({
+            "type": "manifest",
+            "ahl_version": "0.3",
+            "producer": "producer-1",
+            "predecessor": genesis_id,
+            "keys": producer_key_array(&producer),
+            "log": log_block(
+                "sha256:aa", "PT1M", "2026-01-01T00:00:00Z",
+                &producer_key_array(&rotated_log_key)
+            ),
+        });
+        let next_env = ahl_core::envelope(next_payload, &producer);
+
+        let entries = vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&next_env)];
+        let error = resolve(&entries, &config).expect_err("a successor declaring 0.3 is refused");
+        assert!(
+            matches!(
+                &error,
+                MirrorError::UnsupportedStatementVersion {
+                    entry_index: 1,
+                    declared: Some(declared),
+                    expected,
+                } if declared == "0.3" && *expected == ahl_core::AHL_VERSION
+            ),
+            "expected a refusal at the successor naming the declared revision, got: {error}"
+        );
+    }
+
+    /// Revision 0.4 verifies no material issued under an earlier revision (I-D §2.2, §7.1).
+    ///
+    /// The rule covers every governance statement, not just manifests. This `key` statement
+    /// adds a producer key and is signed by the producer the genesis put in force, so its
+    /// signature verifies and its content would otherwise take effect; it declares
+    /// `ahl_version: "0.3"` and is refused at its own entry index instead.
+    #[test]
+    fn a_key_statement_declaring_an_earlier_revision_is_refused() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"25".repeat(32)).expect("seed");
+        let producer_2 =
+            ahl_core::TestKey::from_seed_hex("producer-2", &"26".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"27".repeat(32)).expect("seed");
+        let genesis_env = genesis_manifest(
+            &producer,
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
+        );
+        let config = config_with(&producer, &entry_id_of(&genesis_env));
+
+        let key_payload = json!({
+            "type": "key",
+            "ahl_version": "0.3",
+            "action": "add",
+            "key": {
+                "key_id": producer_2.key_id(), "pubkey": producer_2.pubkey(), "valid_from_index": 1
+            },
+        });
+        let key_env = ahl_core::envelope(key_payload, &producer);
+
+        let entries = vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&key_env)];
+        let error =
+            resolve(&entries, &config).expect_err("a key statement declaring 0.3 is refused");
+        assert!(
+            matches!(
+                &error,
+                MirrorError::UnsupportedStatementVersion {
+                    entry_index: 1,
+                    declared: Some(declared),
+                    expected,
+                } if declared == "0.3" && *expected == ahl_core::AHL_VERSION
+            ),
+            "expected a refusal at the key statement naming the declared revision, got: {error}"
+        );
+    }
+
+    /// A statement that declares no revision at all is refused, not read (I-D §7.5 step 1).
+    ///
+    /// Step 1 of the read is "version first, then parse", so a statement with no
+    /// `ahl_version` member never reaches the parse: there is nothing to compare against the
+    /// revision this build verifies, and treating the absence as an implicit "current" would
+    /// admit exactly the material §2.2 excludes. The refusal reports the absence rather than
+    /// inventing a declared value.
+    #[test]
+    fn a_genesis_manifest_declaring_no_revision_is_refused() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"28".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"29".repeat(32)).expect("seed");
+        let payload = json!({
+            "type": "manifest",
+            "producer": "producer-1",
+            "keys": producer_key_array(&producer),
+            "log": log_block(
+                "sha256:aa", "PT5M", "2026-01-01T00:00:00Z",
+                &producer_key_array(&log_key)
+            ),
+        });
+        let genesis_env = ahl_core::envelope(payload, &producer);
+        let config = config_with(&producer, &entry_id_of(&genesis_env));
+
+        let error = resolve(&[ahl_core::jcs(&genesis_env)], &config)
+            .expect_err("a genesis declaring no revision is refused");
+        assert!(
+            matches!(
+                &error,
+                MirrorError::UnsupportedStatementVersion {
+                    entry_index: 0,
+                    declared: None,
+                    expected,
+                } if *expected == ahl_core::AHL_VERSION
+            ),
+            "expected a refusal reporting the absent declaration, got: {error}"
+        );
+    }
+
+    /// A signature entry in the 0.1-era member shape fails envelope verification.
+    ///
+    /// This fixture declares the current revision and defects only in the signature entry: the
+    /// signing key is named by the member `keyid`, as 0.1.x wrote it, where
+    /// `ahl_core::verify_envelope` reads `key_id`. The refusal therefore comes out of envelope
+    /// verification, before the declared-revision check runs, and names the member it could not
+    /// read. What this pins is the consequence of the member rename alone — the revision gate
+    /// is pinned by the tests above, which use well-formed signatures.
+    #[test]
+    fn a_signature_in_the_earlier_member_shape_fails_envelope_verification() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"2a".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"2b".repeat(32)).expect("seed");
+        let payload = json!({
+            "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
+            "producer": "producer-1",
+            "keys": producer_key_array(&producer),
+            "log": log_block(
+                "sha256:aa", "PT5M", "2026-01-01T00:00:00Z",
+                &producer_key_array(&log_key)
+            ),
+        });
+        let mut genesis_env = ahl_core::envelope(payload, &producer);
+        let signature = genesis_env["signatures"][0]
+            .as_object_mut()
+            .expect("the envelope helper writes one signature object");
+        let key_id = signature.remove("key_id").expect("written under the current member name");
+        signature.insert("keyid".to_owned(), key_id);
+
+        let config = config_with(&producer, &entry_id_of(&genesis_env));
+        let error = resolve(&[ahl_core::jcs(&genesis_env)], &config)
+            .expect_err("an unreadable signature entry is refused");
+        assert!(
+            matches!(&error, MirrorError::Ahl(ahl_core::AhlError::Field(field)) if field == "key_id"),
+            "expected an error naming the unreadable `key_id` member, got: {error}"
+        );
+    }
+
+    /// The revision gate runs before `action` and `key` are read (I-D §7.5 step 1).
+    ///
+    /// This `key` statement is genuinely signed by the producer the genesis put in force and
+    /// declares `ahl_version: "0.3"`, but carries no `action`. Reading `action` first would
+    /// return "candidate ignored" and let the walk finish on the genesis state, reporting
+    /// success over material this revision does not verify; authentication and the revision
+    /// check therefore come first, and the statement is refused.
+    #[test]
+    fn a_key_statement_at_an_earlier_revision_is_refused_before_its_action_is_read() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"2c".repeat(32)).expect("seed");
+        let producer_2 =
+            ahl_core::TestKey::from_seed_hex("producer-2", &"2d".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"2e".repeat(32)).expect("seed");
+        let genesis_env = genesis_manifest(
+            &producer,
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
+        );
+        let config = config_with(&producer, &entry_id_of(&genesis_env));
+
+        let key_payload = json!({
+            "type": "key",
+            "ahl_version": "0.3",
+            "key": {
+                "key_id": producer_2.key_id(), "pubkey": producer_2.pubkey(), "valid_from_index": 1
+            },
+        });
+        let key_env = ahl_core::envelope(key_payload, &producer);
+
+        let entries = vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&key_env)];
+        let error = resolve(&entries, &config).expect_err(
+            "an authentic 0.3 key statement is refused, not skipped for want of an action",
+        );
+        assert!(
+            matches!(
+                &error,
+                MirrorError::UnsupportedStatementVersion {
+                    entry_index: 1,
+                    declared: Some(declared),
+                    expected,
+                } if declared == "0.3" && *expected == ahl_core::AHL_VERSION
+            ),
+            "expected a refusal at the key statement naming the declared revision, got: {error}"
+        );
+    }
+
+    /// The revision gate runs before `predecessor` is read (I-D §7.5 step 1).
+    ///
+    /// Both fixtures are manifests the producer in force really signed, declaring
+    /// `ahl_version: "0.3"`, that would fail the successor link — one carries no `predecessor`,
+    /// the other names one that is in no chain. Reading the link first would return "candidate
+    /// ignored" and leave the genesis governance standing, so `resolve` would return `Ok` on
+    /// the earlier state and the caller would never learn that earlier-revision material was
+    /// present. Both are refused instead.
+    #[test]
+    fn a_later_manifest_at_an_earlier_revision_is_refused_before_predecessor_is_read() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"2f".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"30".repeat(32)).expect("seed");
+        let rotated_log_key =
+            ahl_core::TestKey::from_seed_hex("log-2", &"31".repeat(32)).expect("seed");
+        let genesis_env = genesis_manifest(
+            &producer,
+            "sha256:aa",
+            &producer_key_array(&producer),
+            &producer_key_array(&log_key),
+            "2026-01-01T00:00:00Z",
+        );
+        let config = config_with(&producer, &entry_id_of(&genesis_env));
+
+        let manifest_at_0_3 = |predecessor: Option<&str>| {
+            let mut payload = json!({
+                "type": "manifest",
+                "ahl_version": "0.3",
+                "producer": "producer-1",
+                "keys": producer_key_array(&producer),
+                "log": log_block(
+                    "sha256:aa", "PT1M", "2026-01-01T00:00:00Z",
+                    &producer_key_array(&rotated_log_key)
+                ),
+            });
+            if let Some(predecessor) = predecessor {
+                payload["predecessor"] = json!(predecessor);
+            }
+            ahl_core::envelope(payload, &producer)
+        };
+
+        for (case, next_env) in [
+            ("no predecessor at all", manifest_at_0_3(None)),
+            (
+                "a predecessor naming nothing in the chain",
+                manifest_at_0_3(Some("sha256:not-the-genesis-entry-id")),
+            ),
+        ] {
+            let entries = vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&next_env)];
+            let error = resolve(&entries, &config)
+                .expect_err("an authentic 0.3 successor is refused, not skipped");
+            assert!(
+                matches!(
+                    &error,
+                    MirrorError::UnsupportedStatementVersion {
+                        entry_index: 1,
+                        declared: Some(declared),
+                        expected,
+                    } if declared == "0.3" && *expected == ahl_core::AHL_VERSION
+                ),
+                "case `{case}`: expected a refusal at the successor, got: {error}"
+            );
+        }
+    }
+
+    /// The revision gate runs before the genesis `predecessor` prohibition (I-D §7.5 step 1).
+    ///
+    /// This entry is the one the config names and its signature verifies under the anchored
+    /// genesis producer key, so it is the genesis candidate and nothing else can be; it
+    /// declares `ahl_version: "0.3"` and, being from an earlier revision, also carries a
+    /// `predecessor` that revision 0.4 forbids at genesis. The refusal names the revision — the
+    /// gate that decides whether this material is verifiable at all — rather than reporting the
+    /// chain unresolvable, which is what silently dropping the candidate on the `predecessor`
+    /// prohibition would have produced.
+    #[test]
+    fn a_genesis_manifest_at_an_earlier_revision_is_refused_before_predecessor_is_read() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"32".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"33".repeat(32)).expect("seed");
+        let payload = json!({
+            "type": "manifest",
+            "ahl_version": "0.3",
+            "producer": "producer-1",
+            "predecessor": "sha256:a-genesis-may-not-name-one",
+            "keys": producer_key_array(&producer),
+            "log": log_block(
+                "sha256:aa", "PT5M", "2026-01-01T00:00:00Z",
+                &producer_key_array(&log_key)
+            ),
+        });
+        let genesis_env = ahl_core::envelope(payload, &producer);
+        let config = config_with(&producer, &entry_id_of(&genesis_env));
+
+        let error = resolve(&[ahl_core::jcs(&genesis_env)], &config)
+            .expect_err("an authentic 0.3 genesis candidate is refused");
+        assert!(
+            matches!(
+                &error,
+                MirrorError::UnsupportedStatementVersion {
+                    entry_index: 0,
+                    declared: Some(declared),
+                    expected,
+                } if declared == "0.3" && *expected == ahl_core::AHL_VERSION
+            ),
+            "expected a refusal naming the declared revision, got: {error}"
+        );
     }
 }

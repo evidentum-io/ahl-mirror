@@ -954,6 +954,7 @@ mod tests {
     ) -> serde_json::Value {
         serde_json::json!({
             "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
             "producer": "producer-1",
             "keys": [
                 { "key_id": producer.key_id(), "pubkey": producer.pubkey(), "valid_from_index": 0 }
@@ -1085,6 +1086,7 @@ mod tests {
         let bad_next = stored_entry(
             serde_json::json!({
                 "type": "manifest",
+                "ahl_version": ahl_core::AHL_VERSION,
                 "producer": "producer-1",
                 "predecessor": "sha256:not-the-genesis-entry-id",
                 "keys": [
@@ -1130,6 +1132,7 @@ mod tests {
         let rotation = stored_entry(
             serde_json::json!({
                 "type": "manifest",
+                "ahl_version": ahl_core::AHL_VERSION,
                 "producer": "producer-1",
                 "predecessor": fx.genesis_id,
                 "keys": [
@@ -1319,6 +1322,7 @@ mod tests {
         let relaxed = stored_entry(
             serde_json::json!({
                 "type": "manifest",
+                "ahl_version": ahl_core::AHL_VERSION,
                 "producer": "producer-1",
                 "predecessor": fx.genesis_id,
                 "keys": [

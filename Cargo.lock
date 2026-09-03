@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ahl-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "atl-core",
  "base64",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "ahl-mirror"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahl-core",
  "atl-core",

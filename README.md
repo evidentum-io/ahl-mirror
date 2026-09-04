@@ -89,6 +89,14 @@ A library (`src/lib.rs` and siblings) plus a thin binary (`src/bin/ahl-mirror.rs
 | `config` | the log this mirror serves and the genesis governance anchor it bootstraps from |
 | `http` | an `axum` router — thin handlers over the modules above, nothing more |
 
+`tests/rotation_proof_end_to_end.rs` is the one place this crate runs `ahl-witness` too, as a
+dev-dependency: I-D §7.1's `rotation_proofs[]` element is assembled from both components — this
+crate serves the checkpoint and its inclusion path, the witness serves the cosignature — so the
+test that proves the two halves compose has to run both, and hands the joined element to
+`ahl_core::receipt::verify_receipt_report` unedited. Nothing in the shipped crate depends on the
+witness, and the independence core spec §3.3 requires of one is a runtime property, not a build
+one.
+
 Every business rule is a plain function tested directly, without HTTP in the loop; the HTTP
 layer's own tests check wiring (status codes, byte-exactness, request/response shapes), not
 the rules themselves.

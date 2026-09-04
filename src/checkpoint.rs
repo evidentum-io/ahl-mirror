@@ -179,8 +179,10 @@ fn find_root_divergences(checkpoints: &[Checkpoint]) -> Vec<u64> {
 ///
 /// Entry indices live in `SQLite` `INTEGER` columns, so the store's index space is exactly
 /// `i64`; a checkpoint claiming more entries than that describes a log no store could hold.
-/// Checked before anything is read or allocated for the claim, so an unauthenticated
-/// submission cannot turn a number into work.
+/// Checked inside `ingest_checkpoint` before any claim-dependent work — hash parsing, prefix
+/// construction, store access — so an unauthenticated submission cannot turn the number into
+/// work. (The HTTP layer has already deserialized the body and decoded `raw` by then; those
+/// allocations are bounded by the request-body limit, not by the claim.)
 const MAX_TREE_SIZE: u64 = i64::MAX.unsigned_abs();
 
 const CHECKPOINT_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =

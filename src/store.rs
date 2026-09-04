@@ -350,13 +350,20 @@ impl Store {
     /// not the next expected canonical index), a conflicting occupant at that index, and the
     /// same `entry_id` claimed at a second index.
     ///
+    /// Runs inside a transaction, because promotion is two writes and not one: the canonical
+    /// row and the complete-subtree roots it completes (see the module docs). Committing the
+    /// row and then failing to extend the cache would leave a log whose stored tree material
+    /// disagrees with its entries — the migration would rebuild it on the next open, but until
+    /// then every range and inclusion proof over that span would open the wrong root, so the
+    /// two writes land together or not at all.
+    ///
     /// # Errors
     ///
     /// [`MirrorError::NotStaged`], [`MirrorError::OutOfOrderIndex`],
     /// [`MirrorError::IndexConflict`], [`MirrorError::EntryIdAtDifferentIndex`], or
     /// [`MirrorError::Store`].
     pub fn promote_entry(&self, entry_index: u64, entry_id: &str) -> MirrorResult<InsertOutcome> {
-        self.with_conn(|conn| promote_entry_raw(conn, entry_index, entry_id))
+        self.with_transaction(|conn| promote_entry_raw(conn, entry_index, entry_id))
     }
 
     /// Fetch an entry by its AHL entry id.
@@ -605,6 +612,10 @@ pub(crate) fn get_staged_raw(conn: &Connection, entry_id: &str) -> MirrorResult<
 }
 
 /// The `&Connection` core of [`Store::promote_entry`].
+///
+/// For callers ALREADY inside a transaction: it performs the canonical insert and the
+/// complete-subtree cache extension as two statements, and only the caller's transaction makes
+/// them one write. [`Store::promote_entry`] supplies that transaction for a standalone caller.
 pub(crate) fn promote_entry_raw(
     conn: &Connection,
     entry_index: u64,
@@ -1036,6 +1047,30 @@ pub(crate) fn insert_rotation_checkpoint_raw(
             checkpoint_time: cp.checkpoint_time.clone(),
         });
     }
+
+    // Keep only anchors that could be served. After a rotation that left the LOG key set alone —
+    // I-D §7.1 makes a change to the witness key objects a rotation on its own — every later
+    // checkpoint of the series qualifies as that rotation's anchor, so recording each one would
+    // grow this table with the series to no purpose: [`Store::get_rotation_checkpoint`] serves
+    // the smallest `(tree_size, checkpoint_time)` and nothing else. A candidate no earlier than
+    // one already held is therefore superseded rather than stored. What IS stored stays: an
+    // earlier candidate arriving later is recorded beside the one it supersedes, never over it,
+    // so the served anchor is the minimum over everything ever offered and does not depend on
+    // the order submissions arrived in.
+    let held: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT tree_size, checkpoint_time FROM rotation_checkpoints \
+             WHERE manifest_entry_index = ?1 ORDER BY tree_size ASC, checkpoint_time ASC LIMIT 1",
+            [index_i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((held_size, held_time)) = held {
+        if (held_size, held_time.as_str()) <= (tree_size_i64, cp.checkpoint_time.as_str()) {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
+    }
+
     conn.execute(
         "INSERT INTO rotation_checkpoints (manifest_entry_index, tree_size, log_id, root_hash, \
          checkpoint_time, key_id, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1224,6 +1259,42 @@ mod tests {
             store.subtree_root(0, 9).expect("cache rebuilt"),
             atl_core::core::merkle::compute_root(&expected)
         );
+    }
+
+    /// Promotion is two writes — the canonical row and the complete-subtree roots it completes
+    /// — and they land together or not at all. Injected here by removing the cache table behind
+    /// the store's back, which is the one failure the second write can have that the first
+    /// cannot: without the transaction the entry row would commit and the store would carry a
+    /// leaf whose tree material never recorded it.
+    #[test]
+    fn a_failed_cache_write_rolls_the_promotion_back() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let first = entry_bytes(0);
+        let first_id = ahl_core::sha256_hex(&first);
+        store.stage_entry(&first_id, &first).expect("stage");
+        store.promote_entry(0, &first_id).expect("promote the first entry");
+
+        // Promoting index 1 makes the leaf count 2, which completes the level-1 node — so this
+        // is the promotion whose second write has somewhere to fail.
+        store
+            .with_conn(|conn| {
+                conn.execute("DROP TABLE subtree_roots", [])?;
+                Ok(())
+            })
+            .expect("remove the cache table");
+
+        let second = entry_bytes(1);
+        let second_id = ahl_core::sha256_hex(&second);
+        store.stage_entry(&second_id, &second).expect("stage");
+        assert!(
+            store.promote_entry(1, &second_id).is_err(),
+            "the cache write fails, so the promotion fails"
+        );
+
+        // And it left nothing behind: the index is still free, and the store still ends at 1.
+        assert_eq!(store.next_index().expect("next index"), 1);
+        assert!(store.get_entry_by_id(&second_id).expect("query").is_none());
+        assert_eq!(store.count_entries(0, 99).expect("count"), 1);
     }
 
     #[test]

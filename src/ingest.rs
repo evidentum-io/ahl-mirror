@@ -131,7 +131,9 @@ pub fn promote_entry(
     leaf_index: u64,
     inclusion_path: &[String],
 ) -> MirrorResult<InsertOutcome> {
-    store.with_conn(|conn| promote_entry_in(conn, checkpoint, entry_id, leaf_index, inclusion_path))
+    store.with_transaction(|conn| {
+        promote_entry_in(conn, checkpoint, entry_id, leaf_index, inclusion_path)
+    })
 }
 
 /// The `&Connection` core of [`promote_entry`].

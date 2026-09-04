@@ -200,23 +200,41 @@ not needed.
   32-octet tree nodes), and `build_range_response_measured` reports that figure rather than
   leaving it to be asserted.
 - **Rotation-anchoring checkpoints, held under the outgoing state and served apart**
-  (I-D §7.1's transition exception; adaptor profile §16 item 10). A submitted checkpoint whose
-  signature does not verify under the manifest version active for its own `tree_size` is
-  retried under one rule and one only: the active version must be a **governance-key
-  rotation** — its log key objects or its witness key objects differ from its predecessor's —
-  the checkpoint's `tree_size` must be GREATER than that version's entry index, and the
-  signature must verify under a log key of the PREDECESSOR version's set. Nothing else is ever
-  accepted under a retired key, and a checkpoint that fails this second test is refused with
-  the failure it earned under the ordinary rule. Material so admitted is stored in its own
-  table, is never returned as a series member (`GET /v1/checkpoints`, `/v1/checkpoints/{size}`,
-  `ITUB`, consistency neighbours), and is served only from
+  (I-D §7.1's transition exception; adaptor profile §16 item 10). Every submitted checkpoint is
+  asked two independent questions. The ordinary one: does it verify under the manifest version
+  active for its own `tree_size`? And the exception: is it rotation-anchoring material for any
+  **governance-key rotation** the entry prefix contains — a version whose log key objects or
+  whose witness key objects differ from its predecessor's — with `tree_size` GREATER than that
+  version's entry index and a signature verifying under a log key of the PREDECESSOR version's
+  set? The search is over every such rotation, not merely the active version, because §7.1 says
+  the version active for a rotation proof's checkpoint "is the rotating manifest OR A LATER
+  ONE": a checkpoint several rotations past the one it anchors is matched against that
+  rotation's own predecessor. A submission MAY name the rotation it is offered for
+  (`rotation_for`), which changes nothing about what is accepted and everything about the
+  report — a named rotation the checkpoint does not anchor is refused with the reason.
+
+  A checkpoint can earn BOTH answers, and the case is not exotic: §7.1 makes a change to the
+  witness key objects a rotation on its own, and such a rotation leaves the log key set alone,
+  so the ordinary checkpoints of the series are themselves what a `rotation_proofs[]` element
+  needs. `POST /v1/checkpoints` therefore reports two facts, `series_member` and
+  `rotation_anchors[]`, rather than one choice. The two records point at one checkpoint, held in
+  two tables: the series routes read `checkpoints`, the rotation route reads
+  `rotation_checkpoints`, and neither shadows the other. Nothing else is ever accepted under a
+  retired key, and a checkpoint that answers neither question is refused with the failure it
+  earned under the ordinary rule.
+
+  Rotation material is never returned as a series member (`GET /v1/checkpoints`,
+  `/v1/checkpoints/{size}`, `ITUB`, consistency neighbours). It is served only from
   `GET /v1/rotation-proofs/{manifest_entry_index}`, in the `governance.rotation_proofs[]`
   element shape §7.1 defines — `{manifest_entry_index, checkpoint, inclusion_path, witnesses}`.
   `witnesses` is always empty: a mirror does not cosign, so a deployment claiming L3 fills that
-  member from its witness before the element goes into a receipt. Held apart is not held
-  outside the rules: a rotation-anchoring checkpoint that contradicts a series member at the
-  same `tree_size` is equivocation and is reported through the same path as any other
-  divergence (core spec §7.3), which the rotation route then refuses to serve past.
+  member from its witness before the element goes into a receipt. Where several checkpoints
+  qualify for one rotation, the route serves the smallest `(tree_size, checkpoint_time)`, and
+  the store keeps only anchors that could be served, so which one is served does not depend on
+  the order submissions arrived in. Held apart is not held outside the rules: a
+  rotation-anchoring checkpoint that contradicts a series member at the same `tree_size` is
+  equivocation and is reported through the same path as any other divergence (core spec §7.3),
+  which the rotation route then refuses to serve past.
 - **Two verification states, enforced as a real boundary, not a label** (core spec §7.3).
   `ingest_checkpoint` records every signature-verified checkpoint as **authenticated**;
   `checkpoint::series_view` computes, fresh on every call from the store's current state,

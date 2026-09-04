@@ -326,35 +326,37 @@ struct CheckpointIngestRequest {
     /// key (core spec §7.3).
     #[serde(default)]
     entries_to_promote: Vec<PendingPromotion>,
+    /// The rotating manifest's entry index this checkpoint is offered as ROTATION-ANCHORING
+    /// material for (I-D §7.1), where the submitter names one.
+    ///
+    /// Optional, and naming it changes nothing about what is accepted: the server detects every
+    /// rotation a checkpoint qualifies for either way. What it changes is the REPORT — a named
+    /// rotation the checkpoint does not in fact anchor is refused with the reason, instead of
+    /// being silently admitted as an ordinary series member and quietly anchoring nothing.
+    #[serde(default)]
+    rotation_for: Option<u64>,
 }
 
 /// What `POST /v1/checkpoints` admitted a submission as.
 ///
-/// Reported rather than left implicit: a rotation-anchoring checkpoint is deliberately absent
-/// from every series route (see [`crate::store`]), so a submitter told only "created" would
-/// have no way to tell that outcome from a series admission except by the checkpoint's
-/// subsequent absence.
+/// Reported rather than left implicit, and reported as two independent facts rather than one
+/// choice: a rotation-anchoring checkpoint is deliberately absent from every series route (see
+/// [`crate::store`]), and a checkpoint can be BOTH a series member and a rotation anchor — which
+/// is what a rotation replacing only the witness key objects produces (I-D §7.1; see
+/// [`crate::checkpoint::Admission`]). A submitter told only "created" could tell none of those
+/// cases apart except by where the checkpoint later showed up.
 #[derive(Debug, Serialize)]
-#[serde(tag = "admitted_as", rename_all = "kebab-case")]
-enum AdmissionResponse {
-    /// Admitted to the canonical checkpoint series (adaptor profile §5.2.2).
-    SeriesMember,
-    /// Held as rotation-anchoring material for the rotation at this entry index (I-D §7.1),
-    /// served from `GET /v1/rotation-proofs/{manifest_entry_index}` and from nowhere else.
-    RotationAnchor {
-        /// The entry index of the rotating manifest.
-        manifest_entry_index: u64,
-    },
+struct AdmissionResponse {
+    /// Whether it entered the canonical checkpoint series.
+    series_member: bool,
+    /// The rotating-manifest entry indexes it anchors, served from
+    /// `GET /v1/rotation-proofs/{manifest_entry_index}` and from nowhere else.
+    rotation_anchors: Vec<u64>,
 }
 
 impl From<crate::checkpoint::Admission> for AdmissionResponse {
     fn from(value: crate::checkpoint::Admission) -> Self {
-        match value {
-            crate::checkpoint::Admission::SeriesMember => Self::SeriesMember,
-            crate::checkpoint::Admission::RotationAnchor { manifest_entry_index } => {
-                Self::RotationAnchor { manifest_entry_index }
-            }
-        }
+        Self { series_member: value.series_member, rotation_anchors: value.rotation_anchors }
     }
 }
 
@@ -377,6 +379,7 @@ async fn checkpoint_ingest_handler(
             &req.checkpoint,
             raw_bytes.as_deref(),
             &req.entries_to_promote,
+            req.rotation_for,
         )
     })
     .await?;
@@ -687,6 +690,7 @@ pub mod seam {
             &req.checkpoint,
             raw.as_deref(),
             &req.entries_to_promote,
+            req.rotation_for,
         );
         true
     }
@@ -1698,8 +1702,8 @@ mod tests {
 
             let (status, body) = post_checkpoint(&app, &rotation_cp).await;
             assert_eq!(status, StatusCode::CREATED);
-            assert_eq!(body["admitted_as"], "rotation-anchor");
-            assert_eq!(body["manifest_entry_index"], ROTATING_INDEX);
+            assert_eq!(body["series_member"], false);
+            assert_eq!(body["rotation_anchors"], json!([ROTATING_INDEX]));
 
             // Served on the rotation route, in the `rotation_proofs[]` element shape.
             let (status, element) =
@@ -1734,7 +1738,8 @@ mod tests {
 
             let (status, body) = post_checkpoint(&app, &series_cp).await;
             assert_eq!(status, StatusCode::CREATED);
-            assert_eq!(body["admitted_as"], "series-member");
+            assert_eq!(body["series_member"], true);
+            assert_eq!(body["rotation_anchors"], json!([]));
 
             let (status, members) = get_json(&app, "/v1/checkpoints").await;
             assert_eq!(status, StatusCode::OK);
@@ -1768,8 +1773,11 @@ mod tests {
                 [0x22; 32],
                 "2026-01-01T04:00:00.000000000Z",
             );
-            assert_eq!(post_checkpoint(&app, &series).await.1["admitted_as"], "series-member");
-            assert_eq!(post_checkpoint(&app, &rotation).await.1["admitted_as"], "rotation-anchor");
+            assert_eq!(post_checkpoint(&app, &series).await.1["series_member"], true);
+            assert_eq!(
+                post_checkpoint(&app, &rotation).await.1["rotation_anchors"],
+                json!([ROTATING_INDEX])
+            );
 
             let (status, body) =
                 get_json(&app, &format!("/v1/rotation-proofs/{ROTATING_INDEX}")).await;

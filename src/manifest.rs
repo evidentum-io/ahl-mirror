@@ -417,6 +417,50 @@ fn try_apply_key(
     Ok(())
 }
 
+/// The one walk of `entries_prefix` both [`resolve`] and [`versions`] are views of.
+///
+/// `snapshots`, where given, collects the governance state as each manifest version leaves it —
+/// after phase 3, so a version that failed its checks contributes nothing. A `key` statement
+/// modifies the producer key set and never the log or witness key sets (core spec §2.4.6), so it
+/// is applied to the running state but starts no new version.
+fn walk(
+    entries_prefix: &[Vec<u8>],
+    config: &Config,
+    mut snapshots: Option<&mut Vec<GovernanceState>>,
+) -> MirrorResult<Option<GovernanceState>> {
+    let mut state: Option<GovernanceState> = None;
+    for (i, bytes) in entries_prefix.iter().enumerate() {
+        let index =
+            u64::try_from(i).map_err(|_| MirrorError::IndexOverflow { what: "entry index" })?;
+        let Ok(envelope) = serde_json::from_slice::<Value>(bytes) else { continue };
+        let Some(payload) = envelope.get("payload") else { continue };
+        let Some(kind) = payload.get("type").and_then(Value::as_str) else { continue };
+        match kind {
+            "manifest" => {
+                let before = state.as_ref().map(GovernanceState::governing_manifest_entry_index);
+                try_apply_manifest(&mut state, &envelope, payload, index, config)?;
+                let after = state.as_ref().map(GovernanceState::governing_manifest_entry_index);
+                // The governing index moves if and only if a version was actually installed:
+                // a candidate that failed selection, authentication or validation leaves it
+                // where it was, and two versions can never share an index.
+                if before != after {
+                    if let (Some(list), Some(current)) = (snapshots.as_deref_mut(), state.as_ref())
+                    {
+                        list.push(current.clone());
+                    }
+                }
+            }
+            "key" => {
+                if let Some(current) = state.as_mut() {
+                    try_apply_key(current, &envelope, payload, index)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(state)
+}
+
 /// Walk `entries_prefix` and return the governance state active at the end of it.
 ///
 /// `entries_prefix` MUST be the complete, contiguous entry sequence
@@ -429,53 +473,34 @@ fn try_apply_key(
 /// reached within `entries_prefix` (whether because it is not there yet, or because no entry
 /// verifies as the configured genesis anchor).
 pub fn resolve(entries_prefix: &[Vec<u8>], config: &Config) -> MirrorResult<GovernanceState> {
-    let mut state: Option<GovernanceState> = None;
-    for (i, bytes) in entries_prefix.iter().enumerate() {
-        let index =
-            u64::try_from(i).map_err(|_| MirrorError::IndexOverflow { what: "entry index" })?;
-        let Ok(envelope) = serde_json::from_slice::<Value>(bytes) else { continue };
-        let Some(payload) = envelope.get("payload") else { continue };
-        let Some(kind) = payload.get("type").and_then(Value::as_str) else { continue };
-        match kind {
-            "manifest" => try_apply_manifest(&mut state, &envelope, payload, index, config)?,
-            "key" => {
-                if let Some(current) = state.as_mut() {
-                    try_apply_key(current, &envelope, payload, index)?;
-                }
-            }
-            _ => {}
-        }
-    }
     let tree_size = u64::try_from(entries_prefix.len())
         .map_err(|_| MirrorError::IndexOverflow { what: "entries_prefix.len()" })?;
-    state.ok_or(MirrorError::GovernanceChainUnresolvable { tree_size })
+    walk(entries_prefix, config, None)?
+        .ok_or(MirrorError::GovernanceChainUnresolvable { tree_size })
 }
 
-/// Walk `entries_prefix` and return the governance state active IMMEDIATELY BEFORE
-/// `entry_index` — the state a manifest anchored AT that index would be replacing.
+/// Every verified manifest VERSION in `entries_prefix`, in ascending entry-index order: the
+/// governance state as each one leaves it, beginning with the genesis manifest.
 ///
-/// This is the OUTGOING state of I-D §7.1's transition exception: "the log key objects of the
-/// manifest version preceding the rotating one". It is the plain walk of [`resolve`] over the
-/// strictly shorter prefix `[0, entry_index)`, named because reading a slice expression at the
-/// call site would leave the reader to reconstruct which state it is.
+/// This is what a rotation search needs and [`resolve`] cannot give. I-D §7.1 defines a
+/// governance-key rotation by comparing a version against ITS PREDECESSOR IN THE CHAIN, and a
+/// `rotation_proofs[]` checkpoint's own active version may be "the rotating manifest or a later
+/// one" — so a checkpoint far past several rotations still has to be matched against each
+/// candidate rotation's own predecessor, not against the state at the end of the prefix.
+/// Consecutive elements here are exactly those (predecessor, rotating) pairs.
 ///
 /// # Errors
 ///
-/// [`MirrorError::IndexOverflow`] if `entry_index` exceeds `entries_prefix`, or
-/// [`MirrorError::GovernanceChainUnresolvable`] if no verified genesis manifest is reached
-/// within that shorter prefix — which is the case for the genesis manifest itself, whose
-/// predecessor state does not exist.
-pub fn resolve_before(
-    entries_prefix: &[Vec<u8>],
-    config: &Config,
-    entry_index: u64,
-) -> MirrorResult<GovernanceState> {
-    let upto = usize::try_from(entry_index)
-        .map_err(|_| MirrorError::IndexOverflow { what: "manifest entry index" })?;
-    let head = entries_prefix
-        .get(..upto)
-        .ok_or(MirrorError::GovernanceChainUnresolvable { tree_size: entry_index })?;
-    resolve(head, config)
+/// As [`resolve`].
+pub fn versions(entries_prefix: &[Vec<u8>], config: &Config) -> MirrorResult<Vec<GovernanceState>> {
+    let tree_size = u64::try_from(entries_prefix.len())
+        .map_err(|_| MirrorError::IndexOverflow { what: "entries_prefix.len()" })?;
+    let mut collected = Vec::new();
+    walk(entries_prefix, config, Some(&mut collected))?;
+    if collected.is_empty() {
+        return Err(MirrorError::GovernanceChainUnresolvable { tree_size });
+    }
+    Ok(collected)
 }
 
 #[cfg(test)]
@@ -736,10 +761,11 @@ mod tests {
         let next_env = ahl_core::envelope(next_payload, &producer);
 
         let entries = vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&next_env)];
-        let incoming = resolve(&entries, &config).expect("valid successor");
-        let outgoing = resolve_before(&entries, &config, 1).expect("predecessor state");
+        let chain = versions(&entries, &config).expect("valid successor");
+        let [outgoing, incoming] = chain.as_slice() else { panic!("two versions") };
         assert_eq!(incoming.governing_manifest_entry_index(), 1);
-        assert!(incoming.rotates(&outgoing), "the witness key objects differ");
+        assert_eq!(outgoing.governing_manifest_entry_index(), 0);
+        assert!(incoming.rotates(outgoing), "the witness key objects differ");
 
         // And a version that re-declares BOTH sets unchanged is not a rotation, however much
         // else about it moves — the comparison is over the two key sets and nothing else.
@@ -756,10 +782,10 @@ mod tests {
         });
         let unchanged_env = ahl_core::envelope(unchanged_payload, &producer);
         let entries = vec![ahl_core::jcs(&genesis_env), ahl_core::jcs(&unchanged_env)];
-        let incoming = resolve(&entries, &config).expect("valid successor");
-        let outgoing = resolve_before(&entries, &config, 1).expect("predecessor state");
+        let chain = versions(&entries, &config).expect("valid successor");
+        let [outgoing, incoming] = chain.as_slice() else { panic!("two versions") };
         assert_eq!(incoming.cadence_nanos(), 60_000_000_000, "the cadence did change");
-        assert!(!incoming.rotates(&outgoing), "neither key set did");
+        assert!(!incoming.rotates(outgoing), "neither key set did");
     }
 
     /// A `witnesses` member that is present but malformed makes the manifest invalid

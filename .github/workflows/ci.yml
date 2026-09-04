@@ -6,7 +6,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  AHL_CORE_REF: v0.3.1
+  AHL_CORE_REF: v0.4.0
 
 # `ahl-core` is a path dependency (`../ahl-core`), so every job checks out this crate and the
 # core side by side and runs cargo from the crate directory. The core is a private repository:

@@ -6,6 +6,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  AHL_CORE_REF: v0.3.1
+
+# `ahl-core` is a path dependency (`../ahl-core`), so every job checks out this crate and the
+# core side by side and runs cargo from the crate directory. The core is a private repository:
+# the read-only deploy key `AHL_CORE_DEPLOY_KEY` (added 2026-09-04) authenticates the checkout.
+# `AHL_CORE_REF` MUST move together with the `ahl-core` version requirement in Cargo.toml.
+defaults:
+  run:
+    working-directory: ahl-mirror
 
 jobs:
   fmt:
@@ -13,6 +22,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ahl-mirror
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-core
+          ref: ${{ env.AHL_CORE_REF }}
+          ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
+          path: ahl-core
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -23,11 +40,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ahl-mirror
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-core
+          ref: ${{ env.AHL_CORE_REF }}
+          ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
+          path: ahl-core
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # pedantic, nursery and cargo are denied through #![deny(...)] in lib.rs / the binary.
+      # The lint policy lives in Cargo.toml [lints]; pedantic, nursery and cargo stay at warn there
+      # and are raised by `-D warnings` here.
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -35,8 +61,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ahl-mirror
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-core
+          ref: ${{ env.AHL_CORE_REF }}
+          ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
+          path: ahl-core
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ahl-mirror
       - run: cargo test --all-targets
 
   doc:
@@ -44,8 +80,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ahl-mirror
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-core
+          ref: ${{ env.AHL_CORE_REF }}
+          ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
+          path: ahl-core
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ahl-mirror
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
@@ -55,27 +101,45 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ahl-mirror
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-core
+          ref: ${{ env.AHL_CORE_REF }}
+          ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
+          path: ahl-core
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            .
-            fuzz
+            ahl-mirror
+            ahl-mirror/fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
       # Build only. Compiling and linking the nine targets against the library on every pull
       # request is what keeps them from silently rotting out of step with the API they call;
       # running a campaign is not a gate, and its length is not a property of a pull request.
-      - run: cargo fuzz build
+      - run: cargo fuzz build --target x86_64-unknown-linux-gnu
 
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ahl-mirror
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-core
+          ref: ${{ env.AHL_CORE_REF }}
+          ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
+          path: ahl-core
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ahl-mirror
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       # `src/bin/` is the server's process wiring (config load, socket bind, graceful
@@ -89,6 +153,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ahl-mirror
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-core
+          ref: ${{ env.AHL_CORE_REF }}
+          ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
+          path: ahl-core
       - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ahl-mirror
       - run: cargo check

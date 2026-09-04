@@ -447,7 +447,7 @@ fn build_visible_prefix(
 ///
 /// The pipeline, in order:
 ///
-/// 0. Refuse a `tree_size` above [`MAX_TREE_SIZE`] outright. Everything below reads a claim
+/// 0. Refuse a `tree_size` above `MAX_TREE_SIZE` (the store's `i64` index space) outright. Everything below reads a claim
 ///    that is not yet authenticated, so it is first held to a size a store could hold at all.
 /// 1. Build the visible entry prefix for `cp.tree_size`: canonical storage, overlaid with
 ///    `entries_to_promote` wherever their inclusion proofs verify against `cp`'s *claimed*

@@ -10,6 +10,14 @@ readme = "README.md"
 categories = ["cryptography", "data-structures"]
 keywords = ["provenance", "transparency-log", "merkle-tree", "ahl"]
 
+[features]
+default = []
+# A seam for the fuzz harness in `fuzz/`, and nothing else: it exposes the HTTP request
+# parsers of `http.rs` as plain synchronous functions over request bytes, so a fuzz target can
+# drive them without standing up a server. The request types themselves stay private — they
+# are wire shapes, not API — so the crate's shipped surface is unchanged with the feature off.
+fuzzing = []
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

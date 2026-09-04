@@ -1,0 +1,19 @@
+{
+  "checkpoint": {
+    "checkpoint_time": "2026-01-01T00:04:00.000000000Z",
+    "key_id": "sha256:3097e2dee2cb4a34b53840cdb705aed71067c36f68db0e0f559c3f3fa043315f",
+    "log_id": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "root_hash": "sha256:c2fe1e48dba86f5b9da9c64ffff1382d6116ab11b4800a24b80d1066635d0b32",
+    "signature": "base64:TY7z3ER+ACmMia87cG/jXOq3AIv8pSS0uwPWyByrD15PPRtP3W4GiZ2uhdoCUMVxqXUo11xk7Y7sS3E7J2CvAg==",
+    "tree_size": 2
+  },
+  "entries_to_promote": [
+    {
+      "entry_id": "sha256:473919ef3e71da3d210e344fe321d81744d6c50cab72b889097f3909e88de389",
+      "inclusion_path": [
+        "sha256:55a754267e16ed85f38d26deae92d47b05876d78dd4b6024f352d88c37fa8c48"
+      ],
+      "leaf_index": 1
+    }
+  ]
+}

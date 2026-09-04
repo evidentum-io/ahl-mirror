@@ -1,0 +1,60 @@
+{
+  "checkpoint": {
+    "checkpoint_time": "2026-01-01T00:01:00.000000000Z",
+    "key_id": "sha256:3097e2dee2cb4a34b53840cdb705aed71067c36f68db0e0f559c3f3fa043315f",
+    "log_id": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "root_hash": "sha256:55a754267e16ed85f38d26deae92d47b05876d78dd4b6024f352d88c37fa8c48",
+    "signature": "base64:xwo12sfoc/iX55re3eNK7jGwPThdZQzQ3lLVD2WYkHKJSVNRq1liMqwrTUOvby2jBSgAa/AHBH7ouMFGzM9sDQ==",
+    "tree_size": 1
+  },
+  "entries": [
+    {
+      "entry_index": 0,
+      "envelope": {
+        "payload": {
+          "ahl_version": "0.4",
+          "keys": [
+            {
+              "key_id": "sha256:637743126f7e7d13c8b5f2c90a0b66700bdc186dca3784354ebc6dee6f058884",
+              "pubkey": "base64:GjgYefio3Jc2HQEuO0ciB8xzE+0agckY7r+ocrk0FNk=",
+              "valid_from_index": 0
+            }
+          ],
+          "log": {
+            "adaptor": {
+              "hash": "sha256:00",
+              "id": "ahl-adaptor-atl-v1"
+            },
+            "cadence_epoch": "2026-01-01T00:00:00Z",
+            "checkpoint_cadence": "PT5M",
+            "keys": [
+              {
+                "key_id": "sha256:3097e2dee2cb4a34b53840cdb705aed71067c36f68db0e0f559c3f3fa043315f",
+                "pubkey": "base64:IVL40Zt5HSRFMkLhXy6rbLfP+ntqXtMAl5YOBpiB2xI=",
+                "valid_from_index": 0
+              }
+            ],
+            "log_id": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+            "operator": "op-1",
+            "witness_grace_period": "PT10M"
+          },
+          "producer": "producer-1",
+          "type": "manifest"
+        },
+        "signatures": [
+          {
+            "key_id": "sha256:637743126f7e7d13c8b5f2c90a0b66700bdc186dca3784354ebc6dee6f058884",
+            "sig": "base64:rXL6aGhhS+xVjKCVB3QtzbN5h3Od/AFu7t0g8AVCwYSq0reYAAMg8KG8ThHLqu8jcyznb5Z2Z1zkDbVBICusDg=="
+          }
+        ]
+      }
+    }
+  ],
+  "range": {
+    "from_index": 0,
+    "to_index": 4
+  },
+  "range_proof": {
+    "adaptor_form": "base64:QUhMUlAxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAA=="
+  }
+}

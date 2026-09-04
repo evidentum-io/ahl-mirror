@@ -476,6 +476,118 @@ async fn consistency_handler(
     })))
 }
 
+#[cfg(feature = "fuzzing")]
+pub mod seam {
+    //! Synchronous entry points onto this module's request parsers, for the fuzz harness in
+    //! `fuzz/`.
+    //!
+    //! Each function takes the bytes a client sends and runs exactly what the corresponding
+    //! handler runs: the same private request type, the same field decoding, and the same
+    //! library call — minus `axum`'s routing and the `spawn_blocking` hop, neither of which
+    //! parses anything. The request types are private because they are wire shapes rather
+    //! than API, so a fuzz target cannot name them; this module is the narrowest way to reach
+    //! them without publishing them. Off by default, and the API it adds carries no stability
+    //! promise.
+    //!
+    //! Every function returns `true` if the body parsed and the library call was reached, so
+    //! a target can tell an early reject apart from a completed run. Errors are outcomes, not
+    //! failures: the property under test is that neither ever panics.
+
+    use axum::extract::Query;
+    use axum::http::Uri;
+
+    use super::{
+        decode_base64_field, series_usable_checkpoint, CheckpointIngestRequest, ConsistencyQuery,
+        PromoteRequest, RangeRequest, RetrieveQuery, StageRequest,
+    };
+    use crate::config::Config;
+    use crate::error::MirrorError;
+    use crate::store::Store;
+
+    /// `POST /v1/entries/stage`.
+    pub fn stage(store: &Store, body: &[u8]) -> bool {
+        let Ok(req) = serde_json::from_slice::<StageRequest>(body) else { return false };
+        let Ok(bytes) = decode_base64_field(&req.envelope_base64, "envelope_base64") else {
+            return false;
+        };
+        let _ = crate::ingest::stage_entry(store, &req.entry_id, &bytes, &req.atl_metadata);
+        true
+    }
+
+    /// `POST /v1/entries/promote`.
+    pub fn promote(store: &Store, body: &[u8]) -> bool {
+        let Ok(req) = serde_json::from_slice::<PromoteRequest>(body) else { return false };
+        let _ = store.get_checkpoint(req.tree_size).map(|found| {
+            found.map(|checkpoint| {
+                crate::ingest::promote_entry(
+                    store,
+                    &checkpoint,
+                    &req.entry_id,
+                    req.leaf_index,
+                    &req.inclusion_path,
+                )
+            })
+        });
+        true
+    }
+
+    /// `POST /v1/range`.
+    pub fn range(store: &Store, config: &Config, body: &[u8]) -> bool {
+        let Ok(req) = serde_json::from_slice::<RangeRequest>(body) else { return false };
+        let Ok(checkpoint) = series_usable_checkpoint(store, config, req.tree_size) else {
+            return true;
+        };
+        let Ok(all_entries) = store.get_entries_range(0, checkpoint.tree_size) else {
+            return true;
+        };
+        let _ = crate::range::build_range_response(
+            &checkpoint,
+            req.from_index,
+            req.to_index,
+            &all_entries,
+        );
+        true
+    }
+
+    /// `POST /v1/checkpoints`.
+    pub fn checkpoint_ingest(store: &Store, config: &Config, body: &[u8]) -> bool {
+        let Ok(req) = serde_json::from_slice::<CheckpointIngestRequest>(body) else {
+            return false;
+        };
+        let raw = match req.raw.as_deref().map(|value| decode_base64_field(value, "raw")) {
+            Some(Ok(bytes)) => Some(bytes),
+            Some(Err(_)) => return false,
+            None => None,
+        };
+        let _ = crate::checkpoint::ingest_checkpoint(
+            store,
+            config,
+            &req.checkpoint,
+            raw.as_deref(),
+            &req.entries_to_promote,
+        );
+        true
+    }
+
+    /// `GET /v1/entries/{entry_id}?encoding=…`: the path segment and the query string.
+    pub fn retrieve(store: &Store, entry_id: &str, query: &str) -> bool {
+        let Ok(uri) = format!("/?{query}").parse::<Uri>() else { return false };
+        let Ok(Query(parsed)) = Query::<RetrieveQuery>::try_from_uri(&uri) else { return false };
+        let _base64_form = parsed.encoding.as_deref() == Some("base64");
+        let _ = crate::retrieval::retrieve_by_id(store, entry_id);
+        true
+    }
+
+    /// `GET /v1/consistency?from=…&to=…`.
+    pub fn consistency(store: &Store, config: &Config, query: &str) -> bool {
+        let Ok(uri) = format!("/?{query}").parse::<Uri>() else { return false };
+        let Ok(Query(parsed)) = Query::<ConsistencyQuery>::try_from_uri(&uri) else { return false };
+        let _: Result<_, MirrorError> = series_usable_checkpoint(store, config, parsed.from);
+        let _: Result<_, MirrorError> = series_usable_checkpoint(store, config, parsed.to);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use atl_core::core::merkle::Hash;

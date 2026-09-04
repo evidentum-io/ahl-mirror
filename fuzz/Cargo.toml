@@ -1,0 +1,99 @@
+[package]
+name = "ahl-mirror-fuzz"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.92"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+ahl-core = { path = "../../ahl-core" }
+atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", default-features = false }
+
+[dependencies.ahl-mirror]
+path = ".."
+# The HTTP request parsers are reached through `http::seam`; see that module's documentation.
+features = ["fuzzing"]
+
+[lints.clippy]
+# Every target is panic-free by construction: nothing here unwraps, indexes or asserts. The
+# no-panic policy the parent crate states applies to this crate too, because a panic raised by
+# the harness itself would be reported as a finding against the library under test.
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+panic = "deny"
+
+# Not a member of any workspace: the parent directory is `ahl-mirror` itself, and a fuzz crate
+# that joined it would put `libfuzzer-sys` and its nightly-only instrumentation into the
+# server's own dependency graph.
+[workspace]
+
+[[bin]]
+name = "stage"
+path = "fuzz_targets/stage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "promote"
+path = "fuzz_targets/promote.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checkpoint"
+path = "fuzz_targets/checkpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "range"
+path = "fuzz_targets/range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "range_response"
+path = "fuzz_targets/range_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query"
+path = "fuzz_targets/query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "governance"
+path = "fuzz_targets/governance.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text"
+path = "fuzz_targets/text.rs"
+test = false
+doc = false
+bench = false

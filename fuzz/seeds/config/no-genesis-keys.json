@@ -1,0 +1,6 @@
+{
+  "genesis_manifest_entry_id": "sha256:f2ab1997e2c03ca79cd0f683e4dbba3340e59ddc8ec1d9ebc5389f35fc743662",
+  "genesis_producer_keys": [],
+  "log_id": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "store_path": "/var/lib/ahl-mirror/store.sqlite"
+}

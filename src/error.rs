@@ -165,6 +165,27 @@ pub enum MirrorError {
         need: u64,
     },
 
+    /// A node of the log tree the store should hold is absent: an entry row carrying no log
+    /// leaf hash (`level` 0), or a complete-subtree root missing from the cache. Both are
+    /// derived from entry bytes the store already holds and are rebuilt by the migration on
+    /// open, so an absence at serving time is a storage integrity fault, not a client mistake.
+    #[error("log tree material at level {level}, node {node_index} is missing from the store")]
+    TreeMaterialMissing {
+        /// The tree level (0 for a leaf hash).
+        level: u32,
+        /// The node's index at that level.
+        node_index: u64,
+    },
+
+    /// A stored log-tree node is present but is not 32 octets. A storage integrity fault.
+    #[error("log tree material at level {level}, node {node_index} is not a 32-octet hash")]
+    TreeMaterialCorrupt {
+        /// The tree level (0 for a leaf hash).
+        level: u32,
+        /// The node's index at that level.
+        node_index: u64,
+    },
+
     /// The stored entries for `[0, tree_size)` do not recompute to the checkpoint's
     /// `root_hash`. A storage integrity fault; never served to a caller.
     #[error("stored entries for tree_size {tree_size} do not recompute to its root_hash")]

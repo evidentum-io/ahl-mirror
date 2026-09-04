@@ -74,6 +74,8 @@ impl IntoResponse for ApiError {
             | MirrorError::CheckpointNotSeriesUsable { .. }
             | MirrorError::SeriesEquivocated { .. } => StatusCode::CONFLICT,
             MirrorError::StoredEntryCorrupt { .. }
+            | MirrorError::TreeMaterialMissing { .. }
+            | MirrorError::TreeMaterialCorrupt { .. }
             | MirrorError::CheckpointRootMismatch { .. }
             | MirrorError::IndexOverflow { .. }
             | MirrorError::Atl(_)

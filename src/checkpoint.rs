@@ -22,7 +22,6 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 use crate::config::Config;
 use crate::error::{MirrorError, MirrorResult};
 use crate::manifest::{self, GovernanceState};
-use crate::metadata::log_leaf_hash;
 use crate::store::Store;
 
 /// ATL's fixed 98-byte checkpoint magic (adaptor profile §6.1).
@@ -346,14 +345,18 @@ pub fn verify_series_consistency(
 /// The `&Connection` core of [`leaf_hashes_for`] — usable inside a transaction (see
 /// [`ingest_checkpoint`]), where calling [`leaf_hashes_for`] itself would deadlock by
 /// re-locking the store's mutex.
+///
+/// Reads the leaf hashes the store recorded at promotion (adaptor profile §4.2) rather than
+/// re-deriving them from entry bytes: the two are the same function of the same bytes, and the
+/// stored form is 32 octets per entry instead of a whole envelope.
 fn leaf_hashes_for_conn(conn: &rusqlite::Connection, tree_size: u64) -> MirrorResult<Vec<Hash>> {
-    let entries = crate::store::get_entries_range_raw(conn, 0, tree_size)?;
-    let have = u64::try_from(entries.len())
+    let hashes = crate::store::leaf_hashes_range_raw(conn, 0, tree_size)?;
+    let have = u64::try_from(hashes.len())
         .map_err(|_| MirrorError::IndexOverflow { what: "entries.len()" })?;
     if have != tree_size {
         return Err(MirrorError::IncompleteEntries { have, need: tree_size });
     }
-    Ok(entries.iter().map(|bytes| log_leaf_hash(bytes)).collect())
+    Ok(hashes)
 }
 
 /// Fetch the complete, contiguous log-leaf-hash sequence for `[0, tree_size)`, or report how
@@ -794,6 +797,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ConfigSpec, KeyObjectSpec};
+    use crate::metadata::log_leaf_hash;
 
     fn signed_checkpoint(
         key: &ahl_core::TestKey,

@@ -30,7 +30,7 @@ unimplemented = "deny"
 multiple_crate_versions = "allow"
 
 [dependencies]
-ahl-core = { version = "0.2.0", path = "../ahl-core" }
+ahl-core = { version = "0.3.0", path = "../ahl-core" }
 atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", version = "0.23.2", default-features = false }
 axum = "0.8.9"
 base64 = "0.22"

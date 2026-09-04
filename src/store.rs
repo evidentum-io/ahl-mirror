@@ -34,6 +34,19 @@
 //! entry id and the entry index exactly as the brief specifies; `SQLite` is the file format,
 //! not an architectural commitment beyond that.
 //!
+//! # Rotation-anchoring checkpoints are stored apart
+//!
+//! `rotation_checkpoints` is a second, separate checkpoint table, and separateness is the
+//! point. A rotation-anchoring checkpoint verifies under the OUTGOING log key set rather than
+//! the state active for its own `tree_size` (I-D §7.1's transition exception), so it is not a
+//! member of the canonical series and MUST NOT be served as one — not by `GET /v1/checkpoints`,
+//! not as an `ITUB` bound, not as a consistency neighbour. Holding it in the same table as the
+//! series and filtering on read would make every one of those call sites responsible for
+//! remembering the distinction; holding it apart means none of them can forget. What the two
+//! tables DO share is the equivocation scan (see [`crate::checkpoint::series_view`]): a
+//! rotation-anchoring checkpoint that contradicts a series member at the same `tree_size` is a
+//! divergence like any other.
+//!
 //! # Tree material beside the entries
 //!
 //! Two derived columns/tables exist so that an enumeration response costs `O(window + log n)`
@@ -64,7 +77,9 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Mutex;
 
-use atl_core::core::merkle::{compute_subtree_root, hash_children, Hash};
+use atl_core::core::merkle::{
+    compute_subtree_root, generate_inclusion_proof, hash_children, Hash, InclusionProof,
+};
 use rusqlite::{params, Connection, OptionalExtension as _};
 
 use crate::checkpoint::Checkpoint;
@@ -91,6 +106,16 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     key_id          TEXT NOT NULL,
     signature       TEXT NOT NULL,
     UNIQUE(tree_size, checkpoint_time)
+);
+CREATE TABLE IF NOT EXISTS rotation_checkpoints (
+    manifest_entry_index INTEGER NOT NULL,
+    tree_size            INTEGER NOT NULL,
+    log_id               TEXT NOT NULL,
+    root_hash            TEXT NOT NULL,
+    checkpoint_time      TEXT NOT NULL,
+    key_id               TEXT NOT NULL,
+    signature            TEXT NOT NULL,
+    PRIMARY KEY (manifest_entry_index, tree_size, checkpoint_time)
 );
 CREATE TABLE IF NOT EXISTS subtree_roots (
     level      INTEGER NOT NULL,
@@ -389,6 +414,18 @@ impl Store {
         self.with_conn(|conn| leaf_hashes_range_raw(conn, from_index, to_index))
     }
 
+    /// An RFC 6962 inclusion proof of the leaf at `leaf_index` under a tree of `tree_size`
+    /// (adaptor profile §8.2), opened through the stored tree material.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::Atl`] if the index or size is outside the stored material,
+    /// [`MirrorError::TreeMaterialMissing`]/[`MirrorError::TreeMaterialCorrupt`] for an
+    /// unusable stored node, or [`MirrorError::Store`].
+    pub fn inclusion_proof(&self, leaf_index: u64, tree_size: u64) -> MirrorResult<InclusionProof> {
+        self.with_conn(|conn| inclusion_proof_raw(conn, leaf_index, tree_size))
+    }
+
     /// The RFC 6962 root of the subtree spanning leaves `[offset, offset + size)`, opened
     /// through the stored complete-subtree roots (see the module docs).
     ///
@@ -447,6 +484,88 @@ impl Store {
                 [tree_size_i64],
                 checkpoint_row,
             ))
+        })
+    }
+
+    /// Record a rotation-anchoring checkpoint for the rotation anchored at
+    /// `manifest_entry_index`, apart from the canonical series (see the module docs).
+    ///
+    /// Performs no verification of its own: the caller (see
+    /// [`crate::checkpoint::ingest_checkpoint`]) MUST already have established that the
+    /// checkpoint verifies under the OUTGOING log key set and that the version at
+    /// `manifest_entry_index` is a governance-key rotation. Idempotent for a byte-identical
+    /// resubmission; a different checkpoint at the same `(manifest_entry_index, tree_size,
+    /// checkpoint_time)` is a conflict, on the same append-only footing as the series.
+    /// SEVERAL rotation-anchoring checkpoints for one rotation are legitimate — any checkpoint
+    /// of size greater than the rotating index and signed by the outgoing key is one — so
+    /// distinct sizes and times coexist, and [`Self::get_rotation_checkpoint`] chooses among
+    /// them deterministically.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::SeriesMemberConflict`] or [`MirrorError::Store`].
+    pub fn insert_rotation_checkpoint(
+        &self,
+        manifest_entry_index: u64,
+        cp: &Checkpoint,
+    ) -> MirrorResult<InsertOutcome> {
+        self.with_conn(|conn| insert_rotation_checkpoint_raw(conn, manifest_entry_index, cp))
+    }
+
+    /// The rotation-anchoring checkpoint held for the rotation anchored at
+    /// `manifest_entry_index`, or `None`.
+    ///
+    /// Where several are held, the one with the smallest `(tree_size, checkpoint_time)` is
+    /// returned: it is the earliest attestation of the handover, and it is the cheapest to
+    /// serve, since the inclusion path it grounds runs over the smallest tree. Deterministic
+    /// either way — a route that returned "some member" would let two mirrors holding the same
+    /// material answer differently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MirrorError::Store`] on a database failure.
+    pub fn get_rotation_checkpoint(
+        &self,
+        manifest_entry_index: u64,
+    ) -> MirrorResult<Option<Checkpoint>> {
+        let index_i64 = to_i64("manifest_entry_index", manifest_entry_index)?;
+        self.with_conn(|conn| {
+            row_to_checkpoint(conn.query_row(
+                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
+                 FROM rotation_checkpoints WHERE manifest_entry_index = ?1 \
+                 ORDER BY tree_size ASC, checkpoint_time ASC LIMIT 1",
+                [index_i64],
+                checkpoint_row,
+            ))
+        })
+    }
+
+    /// Every rotation-anchoring checkpoint held, with the rotation it anchors, ordered
+    /// ascending by `(tree_size, checkpoint_time)`.
+    ///
+    /// The equivocation scan of [`crate::checkpoint::series_view`] reads this: material held
+    /// apart from the series is still material this log published, and a root it contradicts a
+    /// series member with is a divergence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MirrorError::Store`] on a database failure.
+    pub fn all_rotation_checkpoints(&self) -> MirrorResult<Vec<(u64, Checkpoint)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT manifest_entry_index, tree_size, log_id, root_hash, checkpoint_time, \
+                 key_id, signature FROM rotation_checkpoints \
+                 ORDER BY tree_size ASC, checkpoint_time ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let index: i64 = row.get(0)?;
+                Ok((index, checkpoint_row_from(row, 1)?))
+            })?;
+            rows.map(|row| {
+                let (index, cp) = row?;
+                Ok((to_u64("manifest_entry_index", index)?, cp))
+            })
+            .collect()
         })
     }
 
@@ -675,6 +794,38 @@ pub(crate) fn leaf_hashes_range_raw(
     Ok(hashes)
 }
 
+/// An RFC 6962 inclusion proof of the leaf at `leaf_index` under a tree of `tree_size`,
+/// opened through the stored tree material (adaptor profile §8.2).
+///
+/// Costs `O(log tree_size)` stored nodes for the same reason [`subtree_root_raw`] does: every
+/// sibling on the path is either a complete power-of-two subtree the cache holds or a short
+/// fold over ones it does. A read failure inside the callback is captured and re-raised rather
+/// than being reported as a missing node.
+pub(crate) fn inclusion_proof_raw(
+    conn: &Connection,
+    leaf_index: u64,
+    tree_size: u64,
+) -> MirrorResult<InclusionProof> {
+    let failure: RefCell<Option<MirrorError>> = RefCell::new(None);
+    let get_node = |level: u32, index: u64| -> Option<Hash> {
+        match tree_node_raw(conn, level, index) {
+            Ok(node) => node,
+            Err(err) => {
+                let mut slot = failure.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(err);
+                }
+                None
+            }
+        }
+    };
+    let proof = generate_inclusion_proof(leaf_index, tree_size, get_node);
+    if let Some(err) = failure.borrow_mut().take() {
+        return Err(err);
+    }
+    Ok(proof?)
+}
+
 /// The RFC 6962 root of the subtree spanning leaves `[offset, offset + size)`, opened through
 /// the stored tree material.
 ///
@@ -861,8 +1012,56 @@ pub(crate) fn insert_checkpoint_raw(
     Ok(InsertOutcome::Inserted)
 }
 
+/// The `&Connection` core of [`Store::insert_rotation_checkpoint`].
+pub(crate) fn insert_rotation_checkpoint_raw(
+    conn: &Connection,
+    manifest_entry_index: u64,
+    cp: &Checkpoint,
+) -> MirrorResult<InsertOutcome> {
+    let index_i64 = to_i64("manifest_entry_index", manifest_entry_index)?;
+    let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
+    let existing = row_to_checkpoint(conn.query_row(
+        "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
+         FROM rotation_checkpoints WHERE manifest_entry_index = ?1 AND tree_size = ?2 \
+         AND checkpoint_time = ?3",
+        params![index_i64, tree_size_i64, cp.checkpoint_time],
+        checkpoint_row,
+    ))?;
+    if let Some(existing) = existing {
+        if &existing == cp {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
+        return Err(MirrorError::SeriesMemberConflict {
+            tree_size: cp.tree_size,
+            checkpoint_time: cp.checkpoint_time.clone(),
+        });
+    }
+    conn.execute(
+        "INSERT INTO rotation_checkpoints (manifest_entry_index, tree_size, log_id, root_hash, \
+         checkpoint_time, key_id, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            index_i64,
+            tree_size_i64,
+            cp.log_id,
+            cp.root_hash,
+            cp.checkpoint_time,
+            cp.key_id,
+            cp.signature
+        ],
+    )?;
+    Ok(InsertOutcome::Inserted)
+}
+
 fn checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {
-    let tree_size: i64 = row.get(0)?;
+    checkpoint_row_from(row, 0)
+}
+
+/// Read a checkpoint from six consecutive columns beginning at `base`, in the order every
+/// query in this module selects them: `tree_size, log_id, root_hash, checkpoint_time, key_id,
+/// signature`.
+fn checkpoint_row_from(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<Checkpoint> {
+    let at = |offset: usize| base.saturating_add(offset);
+    let tree_size: i64 = row.get(at(0))?;
     let tree_size = u64::try_from(tree_size).map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
             0,
@@ -871,12 +1070,12 @@ fn checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {
         )
     })?;
     Ok(Checkpoint {
-        log_id: row.get(1)?,
+        log_id: row.get(at(1))?,
         tree_size,
-        root_hash: row.get(2)?,
-        checkpoint_time: row.get(3)?,
-        key_id: row.get(4)?,
-        signature: row.get(5)?,
+        root_hash: row.get(at(2))?,
+        checkpoint_time: row.get(at(3))?,
+        key_id: row.get(at(4))?,
+        signature: row.get(at(5))?,
     })
 }
 

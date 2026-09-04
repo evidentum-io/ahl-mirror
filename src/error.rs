@@ -339,6 +339,35 @@ pub enum MirrorError {
     #[error("configuration declares no genesis producer keys")]
     NoGenesisProducerKeys,
 
+    /// A checkpoint that did not verify under the state active for its own `tree_size` is
+    /// not ROTATION-ANCHORING material either, so I-D §7.1's transition exception does not
+    /// reach it.
+    ///
+    /// Never the error a submission is refused with: the exception is a second chance, so a
+    /// checkpoint that fails it is reported with the failure it earned under the ordinary rule
+    /// (see [`crate::checkpoint::ingest_checkpoint`]). This variant names why the second chance
+    /// did not apply, for the caller that asks the classification directly.
+    #[error(
+        "checkpoint at tree_size {tree_size} is not rotation-anchoring material for the \
+         manifest at entry index {manifest_entry_index}: {reason}"
+    )]
+    NotRotationMaterial {
+        /// The submitted checkpoint's `tree_size`.
+        tree_size: u64,
+        /// The entry index of the manifest version active for that `tree_size`.
+        manifest_entry_index: u64,
+        /// Which condition of I-D §7.1 was not met.
+        reason: &'static str,
+    },
+
+    /// No rotation-anchoring checkpoint is held for the rotation anchored at this entry index
+    /// (I-D §7.1).
+    #[error("no rotation-anchoring checkpoint is held for the manifest at entry index {manifest_entry_index}")]
+    UnknownRotationProof {
+        /// The requested rotating manifest's entry index.
+        manifest_entry_index: u64,
+    },
+
     /// A checkpoint's signature does not verify against its resolved key.
     #[error("checkpoint signature does not verify against key `{key_id}`")]
     SignatureInvalid {

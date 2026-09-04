@@ -174,6 +174,19 @@ pub enum MirrorError {
     },
 
     // ---- checkpoints (adaptor profile §5.2.2, §6) ----
+    /// A checkpoint claimed a `tree_size` larger than this mirror could ever address.
+    ///
+    /// Entry indices are stored as `SQLite` `INTEGER`, so `i64::MAX` bounds the index space
+    /// that exists here at all. A claim above it is malformed rather than merely unmet — no
+    /// store could hold it — and is refused before any of it is read or allocated for.
+    #[error("`tree_size` {tree_size} exceeds the largest addressable log size {max}")]
+    TreeSizeUnrepresentable {
+        /// The `tree_size` the checkpoint claimed.
+        tree_size: u64,
+        /// The largest `tree_size` this mirror can address.
+        max: u64,
+    },
+
     /// A `checkpoint_time` value is not the exact nine-fractional-digit RFC 3339 rendering
     /// adaptor profile §6.3 requires.
     #[error("`{value}` is not a valid adaptor-profile §6.3 checkpoint_time")]

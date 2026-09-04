@@ -11,6 +11,8 @@
 //! [`SeriesView::root_divergences`] makes explicit the corollary the ordering exists to
 //! support: members sharing a `tree_size` MUST carry the same `root_hash`.
 
+use std::collections::BTreeMap;
+
 use atl_core::core::merkle::{compute_root, generate_consistency_proof, verify_consistency, Hash};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
@@ -172,6 +174,14 @@ fn find_root_divergences(checkpoints: &[Checkpoint]) -> Vec<u64> {
     }
     divergences
 }
+
+/// The largest `tree_size` this mirror can address.
+///
+/// Entry indices live in `SQLite` `INTEGER` columns, so the store's index space is exactly
+/// `i64`; a checkpoint claiming more entries than that describes a log no store could hold.
+/// Checked before anything is read or allocated for the claim, so an unauthenticated
+/// submission cannot turn a number into work.
+const MAX_TREE_SIZE: u64 = i64::MAX.unsigned_abs();
 
 const CHECKPOINT_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z");
@@ -375,27 +385,28 @@ fn build_visible_prefix(
     target_tree_size: u64,
     claimed_root: &Hash,
 ) -> MirrorResult<Vec<Vec<u8>>> {
-    let canonical = store.get_entries_range(0, target_tree_size)?;
-    let target_usize = usize::try_from(target_tree_size)
-        .map_err(|_| MirrorError::IndexOverflow { what: "target_tree_size" })?;
-    let mut slots: Vec<Option<Vec<u8>>> = canonical.into_iter().map(Some).collect();
-    slots.resize(target_usize, None);
+    // Canonical rows occupy `[0, canonical_len)` with no gaps: `store::insert_entry_raw`
+    // refuses any index other than the next one, so storage is append-only and contiguous.
+    let mut prefix = store.get_entries_range(0, target_tree_size)?;
+    let canonical_len = u64::try_from(prefix.len())
+        .map_err(|_| MirrorError::IndexOverflow { what: "entries.len()" })?;
 
+    // A sparse overlay keyed by leaf index, rather than a dense array of `target_tree_size`
+    // slots. `target_tree_size` is the checkpoint's own unauthenticated claim — this runs
+    // before the signature is verified (see [`ingest_checkpoint`] step 2) — so sizing any
+    // allocation by it would let one request name a number and have this process try to
+    // allocate for it. Every structure here is sized by material actually in hand instead:
+    // the rows storage returned, and the promotions the request carries.
+    let mut overlay: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     for p in pending {
         if p.leaf_index >= target_tree_size {
             continue; // irrelevant to this resolution; real promotion still validates it later
         }
-        let idx = usize::try_from(p.leaf_index)
-            .map_err(|_| MirrorError::IndexOverflow { what: "leaf_index" })?;
-        // `slots` has exactly `target_usize` elements and the guard above established
-        // `p.leaf_index < target_tree_size`, so the slot is present. Reading and writing it
-        // through the one `get_mut` keeps that reasoning next to the access rather than
-        // spread over two bare indexings.
-        let Some(slot) = slots.get_mut(idx) else {
-            return Err(MirrorError::IndexOverflow { what: "leaf_index" });
-        };
-        if slot.is_some() {
+        if p.leaf_index < canonical_len {
             continue; // already canonical; a tentative duplicate is not consulted
+        }
+        if overlay.contains_key(&p.leaf_index) {
+            continue; // the first claim on a slot wins, as it did when slots were dense
         }
         let bytes = store
             .get_staged(&p.entry_id)?
@@ -413,23 +424,29 @@ fn build_visible_prefix(
                 tree_size: target_tree_size,
             });
         }
-        *slot = Some(bytes);
+        overlay.insert(p.leaf_index, bytes);
     }
 
-    let mut result = Vec::with_capacity(target_usize);
-    for slot in slots {
-        match slot {
-            Some(bytes) => result.push(bytes),
-            None => break, // a plain gap: stop here, not an error (see docs above)
-        }
+    // Extend the canonical run for as long as the overlay supplies the very next index. This
+    // is the same longest-contiguous-prefix a dense slot array yielded, and it grows only by
+    // entries that exist; a plain gap stops the walk rather than being an error (see above).
+    let mut next = canonical_len;
+    while next < target_tree_size {
+        let Some(bytes) = overlay.remove(&next) else { break };
+        prefix.push(bytes);
+        next = next
+            .checked_add(1)
+            .ok_or(MirrorError::IndexOverflow { what: "visible prefix length" })?;
     }
-    Ok(result)
+    Ok(prefix)
 }
 
 /// Verify and admit `cp` as an **authenticated** checkpoint (core spec §7.3).
 ///
 /// The pipeline, in order:
 ///
+/// 0. Refuse a `tree_size` above [`MAX_TREE_SIZE`] outright. Everything below reads a claim
+///    that is not yet authenticated, so it is first held to a size a store could hold at all.
 /// 1. Build the visible entry prefix for `cp.tree_size`: canonical storage, overlaid with
 ///    `entries_to_promote` wherever their inclusion proofs verify against `cp`'s *claimed*
 ///    root. This is safe before authentication — the checkpoint's own root is never trusted
@@ -472,6 +489,12 @@ pub fn ingest_checkpoint(
     raw: Option<&[u8]>,
     entries_to_promote: &[PendingPromotion],
 ) -> MirrorResult<()> {
+    if cp.tree_size > MAX_TREE_SIZE {
+        return Err(MirrorError::TreeSizeUnrepresentable {
+            tree_size: cp.tree_size,
+            max: MAX_TREE_SIZE,
+        });
+    }
     let claimed_root: Hash = ahl_core::parse_hash_hex(&cp.root_hash)?;
     let prefix = build_visible_prefix(store, entries_to_promote, cp.tree_size, &claimed_root)?;
 

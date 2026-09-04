@@ -1050,6 +1050,29 @@ mod tests {
         assert_eq!(submit_checkpoint(&app, &cp, &[]).await, StatusCode::BAD_REQUEST);
     }
 
+    /// A checkpoint may claim any `tree_size` it likes, and the claim is read before its
+    /// signature is verified. Sizing an allocation by that claim let an unauthenticated
+    /// `POST /v1/checkpoints` abort the process: `i64::MAX` overflowed the capacity
+    /// computation outright, and merely large values exhausted memory first. Both are
+    /// rejections now, and the work stays proportional to the entries actually held.
+    #[tokio::test]
+    async fn an_oversized_tree_size_claim_is_rejected_not_allocated_for() {
+        let hx = harness();
+        let app = router(hx.state.clone());
+        for tree_size in [u64::try_from(i64::MAX).expect("positive"), 1u64 << 40, u64::MAX] {
+            let cp = crate::checkpoint::Checkpoint {
+                log_id: hx.log_id.clone(),
+                tree_size,
+                root_hash: format!("sha256:{}", hex::encode(hx.genesis_leaf)),
+                checkpoint_time: "2026-01-01T00:00:00.000000000Z".to_owned(),
+                key_id: hx.log_key.key_id(),
+                signature: "base64:AAAA".to_owned(),
+            };
+            let status = submit_checkpoint(&app, &cp, &[]).await;
+            assert!(status.is_client_error(), "tree_size {tree_size} gave {status}");
+        }
+    }
+
     #[tokio::test]
     async fn a_checkpoint_signed_outside_its_key_validity_range_is_a_400() {
         // The "checkpoint signed by a key outside its validity range" negative test,
@@ -1242,6 +1265,28 @@ mod tests {
     mod seam {
         use super::super::seam;
         use super::*;
+
+        /// The same unauthenticated oversized-claim input, driven through the seam the
+        /// `checkpoint` fuzz target uses, so a regression is caught by the harness too.
+        #[test]
+        fn an_oversized_tree_size_claim_does_not_abort_the_seam() {
+            let fx = harness();
+            for tree_size in [u64::try_from(i64::MAX).expect("positive"), 1u64 << 40, u64::MAX] {
+                let body = json!({ "checkpoint": {
+                    "log_id": fx.log_id.clone(),
+                    "tree_size": tree_size,
+                    "root_hash": format!("sha256:{}", hex::encode(fx.genesis_leaf)),
+                    "checkpoint_time": "2026-01-01T00:00:00.000000000Z",
+                    "key_id": fx.log_key.key_id(),
+                    "signature": "base64:AAAA",
+                }});
+                assert!(seam::checkpoint_ingest(
+                    &fx.state.store,
+                    &fx.state.config,
+                    &serde_json::to_vec(&body).expect("serialize")
+                ));
+            }
+        }
 
         #[test]
         fn every_seam_entry_point_parses_a_request_and_refuses_garbage() {

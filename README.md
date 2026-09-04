@@ -23,7 +23,11 @@ neither is a panic and neither is something a server can decline; nesting depth 
 `serde_json`, which refuses a document nested deeper than 128 levels with an error rather than
 recursing, so a `Value` obtained by parsing a request body is already bounded when this crate
 sees it, while a `Value` built programmatically to arbitrary depth is not and is outside the
-claim; the size of a request body is bounded by the deployment's own HTTP layer and not here;
+claim; no structure is ever sized by a number a request merely claims — a checkpoint's
+`tree_size` is refused above the store's addressable `i64` index space and, below it, is
+never allocated for, so the work a submission costs stays proportional to the entries
+actually held rather than to the size it asserts; the size of a request body is bounded by
+the deployment's own HTTP layer and not here;
 and `ahl-core` and `atl-core` — which perform canonicalization, envelope verification, node
 hashing and proof verification — are not covered, because the claim is about this crate's own
 code. `ahl-core` states the same claim for itself.

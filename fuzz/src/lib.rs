@@ -123,7 +123,7 @@ pub fn fresh_store() -> Option<Store> {
     let store = Store::open_in_memory().ok()?;
     store.stage_entry(&fx.genesis_id, &fx.genesis_bytes).ok()?;
     store.promote_entry(0, &fx.genesis_id).ok()?;
-    ahl_mirror::checkpoint::ingest_checkpoint(&store, &fx.config, &fx.checkpoint, None, &[])
+    ahl_mirror::checkpoint::ingest_checkpoint(&store, &fx.config, &fx.checkpoint, None, &[], None)
         .ok()?;
     Some(store)
 }

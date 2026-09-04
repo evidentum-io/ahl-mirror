@@ -1,0 +1,10 @@
+{
+  "checkpoint": {
+    "checkpoint_time": "2026-01-01T00:01:00.000000000Z",
+    "key_id": "sha256:3097e2dee2cb4a34b53840cdb705aed71067c36f68db0e0f559c3f3fa043315f",
+    "log_id": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "root_hash": "sha256:55a754267e16ed85f38d26deae92d47b05876d78dd4b6024f352d88c37fa8c48",
+    "signature": "base64:xwo12sfoc/iX55re3eNK7jGwPThdZQzQ3lLVD2WYkHKJSVNRq1liMqwrTUOvby2jBSgAa/AHBH7ouMFGzM9sDQ==",
+    "tree_size": 9223372036854775807
+  }
+}

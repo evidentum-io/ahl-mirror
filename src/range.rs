@@ -98,7 +98,12 @@ pub fn build_range_response(
         .map_err(|_| MirrorError::IndexOverflow { what: "from_index" })?;
     let to =
         usize::try_from(to_index).map_err(|_| MirrorError::IndexOverflow { what: "to_index" })?;
-    let span = &leaf_hashes[from..to];
+    // `leaf_hashes` has one element per entry, `have == checkpoint.tree_size` was checked
+    // above, and the range guard established `from < to <= tree_size`; these lookups restate
+    // that rather than trusting it, because `from`/`to` originate in a client's query.
+    let out_of_range =
+        || MirrorError::InvalidRange { from_index, to_index, tree_size: checkpoint.tree_size };
+    let span = leaf_hashes.get(from..to).ok_or_else(out_of_range)?;
     if !range_proof::verify(&proof, span, &root)? {
         // Generation and the checkpoint root both checked out individually; a proof that
         // still fails to verify indicates a defect in this crate, not bad input. Surfaced
@@ -106,7 +111,9 @@ pub fn build_range_response(
         return Err(MirrorError::CheckpointRootMismatch { tree_size: checkpoint.tree_size });
     }
 
-    let entries = all_entries[from..to]
+    let entries = all_entries
+        .get(from..to)
+        .ok_or_else(out_of_range)?
         .iter()
         .enumerate()
         .map(|(offset, bytes)| -> MirrorResult<EnumeratedEntry> {

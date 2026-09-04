@@ -4,6 +4,34 @@ An independent mirror for the [AHL Protocol](https://atl-protocol.org)'s `ahl-ad
 profile: byte-exact retrieval by entry id, authenticated range enumeration, and the canonical
 checkpoint series a corpus needs to reach conformance level L3 on an ATL-backed log.
 
+## No panic
+
+`ahl-mirror` reaches no panicking construct on any input to the parsers it exposes — the
+request bodies and query strings of its six routes (staging, promotion, range enumeration,
+checkpoint ingest, retrieval and consistency), the checkpoint, `manifest` and `key` statements
+it ingests and walks, the range-enumeration responses it verifies offline, and the deployment
+configuration it reads at startup. Malformed, hostile or simply absurd input is reported as an
+error and rendered as an HTTP status, never as an abort of the server process or of the task
+serving the request. The mechanism is the package-level lints in `Cargo.toml`
+(`clippy::unwrap_used`, `expect_used`, `indexing_slicing`, `arithmetic_side_effects`, `panic`,
+`unreachable`, `todo`, `unimplemented`, `missing_panics_doc`, all denied and satisfied in
+library and binary code rather than allowed at a site); the evidence is the nine libFuzzer
+targets in [`fuzz/`](fuzz/README.md). The boundary: I/O, `SQLite` and network failures are
+results rather than panics, and a store that cannot be opened or migrated is reported to the
+operator instead of raised; allocation failure and stack exhaustion are out of scope, since
+neither is a panic and neither is something a server can decline; nesting depth is bounded by
+`serde_json`, which refuses a document nested deeper than 128 levels with an error rather than
+recursing, so a `Value` obtained by parsing a request body is already bounded when this crate
+sees it, while a `Value` built programmatically to arbitrary depth is not and is outside the
+claim; no structure is ever sized by a number a request merely claims — a checkpoint's
+`tree_size` is refused above the store's addressable `i64` index space and, below it, is
+never allocated for, so the work a submission costs stays proportional to the entries
+actually held rather than to the size it asserts; the size of a request body is bounded by
+the deployment's own HTTP layer and not here;
+and `ahl-core` and `atl-core` — which perform canonicalization, envelope verification, node
+hashing and proof verification — are not covered, because the claim is about this crate's own
+code. `ahl-core` states the same claim for itself.
+
 ## Why this exists
 
 The AHL core specification's log-binding contract (core spec §3) requires two interfaces a

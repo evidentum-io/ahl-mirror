@@ -1,0 +1,8 @@
+{
+  "entry_id": "sha256:473919ef3e71da3d210e344fe321d81744d6c50cab72b889097f3909e88de389",
+  "inclusion_path": [
+    "sha256:55a754267e16ed85f38d26deae92d47b05876d78dd4b6024f352d88c37fa8c48"
+  ],
+  "leaf_index": 1,
+  "tree_size": 2
+}

@@ -51,23 +51,24 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs, rust_2018_idioms)]
 #![deny(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
-#![deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::todo,
-    clippy::unimplemented
-)]
 // `ahl-core`'s pinned `atl-core` revision brings `thiserror` 1.x (and the `syn` 2.x it needs)
 // while this crate's own `thiserror` is 2.x (needing `syn` 3.x): see ahl-core's Cargo.toml
 // for the fuller rationale. Not actionable from library code.
 #![allow(clippy::multiple_crate_versions)]
-// Test code favours `.expect()` messages that document the fixture and, occasionally,
-// `panic!` inside a match arm the test proves unreachable. Production code paths are held to
-// the deny above without exception.
+// Test code favours `.expect()` messages that document the fixture, direct indexing and
+// arithmetic over fixture sizes it fixes itself, and, occasionally, `panic!` inside a match
+// arm the test proves unreachable — an assertion that fires is the failure report there.
+// Production code paths are held to the manifest's deny without exception.
 #![cfg_attr(
     test,
-    allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::missing_panics_doc)
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::panic,
+        clippy::missing_panics_doc
+    )
 )]
 
 pub mod checkpoint;

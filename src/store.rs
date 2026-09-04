@@ -108,6 +108,15 @@ fn to_u64(what: &'static str, value: i64) -> MirrorResult<u64> {
     u64::try_from(value).map_err(|_| MirrorError::IndexOverflow { what })
 }
 
+/// One past a stored `MAX(entry_index)`: the next canonical index the store expects.
+///
+/// `SQLite` holds an entry index as an `i64`, so the successor of anything this can read back
+/// is representable; the check is here so that no arithmetic in this module can wrap silently
+/// if a row ever carries a value outside that range.
+fn next_after(what: &'static str, value: i64) -> MirrorResult<u64> {
+    to_u64(what, value)?.checked_add(1).ok_or(MirrorError::IndexOverflow { what })
+}
+
 impl Store {
     /// Open (creating if absent) a store backed by the `SQLite` file at `path`.
     ///
@@ -268,7 +277,7 @@ impl Store {
         self.with_conn(|conn| {
             let max: Option<i64> =
                 conn.query_row("SELECT MAX(entry_index) FROM entries", [], |row| row.get(0))?;
-            max.map_or(Ok(0), |m| Ok(to_u64("next_index", m)? + 1))
+            max.map_or(Ok(0), |m| next_after("next_index", m))
         })
     }
 
@@ -456,7 +465,7 @@ pub(crate) fn promote_entry_raw(
         conn.query_row("SELECT MAX(entry_index) FROM entries", [], |row| row.get(0))?;
     let expected = match max {
         None => 0,
-        Some(m) => to_u64("next_index", m)? + 1,
+        Some(m) => next_after("next_index", m)?,
     };
     if entry_index != expected {
         return Err(MirrorError::OutOfOrderIndex { expected, got: entry_index });

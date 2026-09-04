@@ -4,13 +4,6 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs, rust_2018_idioms)]
 #![deny(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
-#![deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::todo,
-    clippy::unimplemented
-)]
 // See ahl-core's Cargo.toml and this crate's lib.rs for the rationale: transitive deps pull
 // both syn 2.x/3.x and thiserror 1.x/2.x. Not actionable from this binary.
 #![allow(clippy::multiple_crate_versions)]

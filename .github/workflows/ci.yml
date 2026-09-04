@@ -50,6 +50,25 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  fuzz:
+    name: Fuzz build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # Build only. Compiling and linking the nine targets against the library on every pull
+      # request is what keeps them from silently rotting out of step with the API they call;
+      # running a campaign is not a gate, and its length is not a property of a pull request.
+      - run: cargo fuzz build
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest

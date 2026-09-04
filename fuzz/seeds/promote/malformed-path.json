@@ -1,0 +1,9 @@
+{
+  "entry_id": "sha256:f2ab1997e2c03ca79cd0f683e4dbba3340e59ddc8ec1d9ebc5389f35fc743662",
+  "inclusion_path": [
+    "not-a-hash",
+    "sha256:zz"
+  ],
+  "leaf_index": 0,
+  "tree_size": 1
+}

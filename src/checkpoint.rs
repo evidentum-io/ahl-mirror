@@ -11,6 +11,8 @@
 //! [`SeriesView::root_divergences`] makes explicit the corollary the ordering exists to
 //! support: members sharing a `tree_size` MUST carry the same `root_hash`.
 
+use std::collections::BTreeMap;
+
 use atl_core::core::merkle::{compute_root, generate_consistency_proof, verify_consistency, Hash};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
@@ -173,6 +175,16 @@ fn find_root_divergences(checkpoints: &[Checkpoint]) -> Vec<u64> {
     divergences
 }
 
+/// The largest `tree_size` this mirror can address.
+///
+/// Entry indices live in `SQLite` `INTEGER` columns, so the store's index space is exactly
+/// `i64`; a checkpoint claiming more entries than that describes a log no store could hold.
+/// Checked inside `ingest_checkpoint` before any claim-dependent work — hash parsing, prefix
+/// construction, store access — so an unauthenticated submission cannot turn the number into
+/// work. (The HTTP layer has already deserialized the body and decoded `raw` by then; those
+/// allocations are bounded by the request-body limit, not by the claim.)
+const MAX_TREE_SIZE: u64 = i64::MAX.unsigned_abs();
+
 const CHECKPOINT_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z");
 
@@ -189,6 +201,35 @@ pub fn render_checkpoint_time(nanos: u64) -> MirrorResult<String> {
         .map_err(|_| MirrorError::BadCheckpointTime { value: nanos.to_string() })
 }
 
+/// The exact byte positions of the seven literal characters in the rendering adaptor profile
+/// §6.3 fixes, `YYYY-MM-DDTHH:MM:SS.fffffffffZ`.
+const CHECKPOINT_TIME_LITERALS: [(usize, u8); 7] =
+    [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'.'), (29, b'Z')];
+
+/// The length of that rendering.
+const CHECKPOINT_TIME_LEN: usize = 30;
+
+/// Whether `value` has exactly that shape: thirty ASCII characters, the seven literals in
+/// their fixed positions, and a digit everywhere else — nine of them in the subsecond field.
+///
+/// Checked before `value` reaches the datetime parser rather than left to it. That parser's
+/// subsecond combinator is told to expect exactly nine digits and derives a width by
+/// subtraction from the digits it actually consumed, which underflows when it is handed
+/// fewer — so a value of the wrong shape must never reach it. `checkpoint_time` arrives in a
+/// request body, so the wrong shape is an ordinary input, not a remote possibility.
+fn has_profile_time_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != CHECKPOINT_TIME_LEN {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(at, byte)| {
+        CHECKPOINT_TIME_LITERALS
+            .iter()
+            .find_map(|(position, literal)| (*position == at).then_some(*byte == *literal))
+            .unwrap_or_else(|| byte.is_ascii_digit())
+    })
+}
+
 /// Parse `checkpoint_time` to its exact unix-nanosecond value.
 ///
 /// Rejects anything that is not exactly the rendering adaptor profile §6.3 specifies —
@@ -202,6 +243,9 @@ pub fn render_checkpoint_time(nanos: u64) -> MirrorResult<String> {
 /// round-trip back to itself.
 pub fn parse_checkpoint_time(value: &str) -> MirrorResult<u64> {
     let bad = || MirrorError::BadCheckpointTime { value: value.to_owned() };
+    if !has_profile_time_shape(value) {
+        return Err(bad());
+    }
     let parsed = PrimitiveDateTime::parse(value, CHECKPOINT_TIME_FORMAT).map_err(|_| bad())?;
     let nanos = parsed.assume_utc().unix_timestamp_nanos();
     let nanos = u64::try_from(nanos).map_err(|_| bad())?;
@@ -343,20 +387,28 @@ fn build_visible_prefix(
     target_tree_size: u64,
     claimed_root: &Hash,
 ) -> MirrorResult<Vec<Vec<u8>>> {
-    let canonical = store.get_entries_range(0, target_tree_size)?;
-    let target_usize = usize::try_from(target_tree_size)
-        .map_err(|_| MirrorError::IndexOverflow { what: "target_tree_size" })?;
-    let mut slots: Vec<Option<Vec<u8>>> = canonical.into_iter().map(Some).collect();
-    slots.resize(target_usize, None);
+    // Canonical rows occupy `[0, canonical_len)` with no gaps: `store::insert_entry_raw`
+    // refuses any index other than the next one, so storage is append-only and contiguous.
+    let mut prefix = store.get_entries_range(0, target_tree_size)?;
+    let canonical_len = u64::try_from(prefix.len())
+        .map_err(|_| MirrorError::IndexOverflow { what: "entries.len()" })?;
 
+    // A sparse overlay keyed by leaf index, rather than a dense array of `target_tree_size`
+    // slots. `target_tree_size` is the checkpoint's own unauthenticated claim — this runs
+    // before the signature is verified (see [`ingest_checkpoint`] step 2) — so sizing any
+    // allocation by it would let one request name a number and have this process try to
+    // allocate for it. Every structure here is sized by material actually in hand instead:
+    // the rows storage returned, and the promotions the request carries.
+    let mut overlay: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     for p in pending {
         if p.leaf_index >= target_tree_size {
             continue; // irrelevant to this resolution; real promotion still validates it later
         }
-        let idx = usize::try_from(p.leaf_index)
-            .map_err(|_| MirrorError::IndexOverflow { what: "leaf_index" })?;
-        if slots[idx].is_some() {
+        if p.leaf_index < canonical_len {
             continue; // already canonical; a tentative duplicate is not consulted
+        }
+        if overlay.contains_key(&p.leaf_index) {
+            continue; // the first claim on a slot wins, as it did when slots were dense
         }
         let bytes = store
             .get_staged(&p.entry_id)?
@@ -374,23 +426,29 @@ fn build_visible_prefix(
                 tree_size: target_tree_size,
             });
         }
-        slots[idx] = Some(bytes);
+        overlay.insert(p.leaf_index, bytes);
     }
 
-    let mut result = Vec::with_capacity(target_usize);
-    for slot in slots {
-        match slot {
-            Some(bytes) => result.push(bytes),
-            None => break, // a plain gap: stop here, not an error (see docs above)
-        }
+    // Extend the canonical run for as long as the overlay supplies the very next index. This
+    // is the same longest-contiguous-prefix a dense slot array yielded, and it grows only by
+    // entries that exist; a plain gap stops the walk rather than being an error (see above).
+    let mut next = canonical_len;
+    while next < target_tree_size {
+        let Some(bytes) = overlay.remove(&next) else { break };
+        prefix.push(bytes);
+        next = next
+            .checked_add(1)
+            .ok_or(MirrorError::IndexOverflow { what: "visible prefix length" })?;
     }
-    Ok(result)
+    Ok(prefix)
 }
 
 /// Verify and admit `cp` as an **authenticated** checkpoint (core spec §7.3).
 ///
 /// The pipeline, in order:
 ///
+/// 0. Refuse a `tree_size` above [`MAX_TREE_SIZE`] outright. Everything below reads a claim
+///    that is not yet authenticated, so it is first held to a size a store could hold at all.
 /// 1. Build the visible entry prefix for `cp.tree_size`: canonical storage, overlaid with
 ///    `entries_to_promote` wherever their inclusion proofs verify against `cp`'s *claimed*
 ///    root. This is safe before authentication — the checkpoint's own root is never trusted
@@ -433,6 +491,12 @@ pub fn ingest_checkpoint(
     raw: Option<&[u8]>,
     entries_to_promote: &[PendingPromotion],
 ) -> MirrorResult<()> {
+    if cp.tree_size > MAX_TREE_SIZE {
+        return Err(MirrorError::TreeSizeUnrepresentable {
+            tree_size: cp.tree_size,
+            max: MAX_TREE_SIZE,
+        });
+    }
     let claimed_root: Hash = ahl_core::parse_hash_hex(&cp.root_hash)?;
     let prefix = build_visible_prefix(store, entries_to_promote, cp.tree_size, &claimed_root)?;
 
@@ -569,13 +633,16 @@ fn compute_gap_free_frontier(
         });
     };
     let genesis_entry_index = first_governance.genesis_entry_index();
-    let Some(genesis_governance) = resolve_governance_for(store, config, genesis_entry_index + 1)?
-    else {
+    // The genesis checkpoint's `tree_size`. `genesis_entry_index` is a position in this
+    // store's own canonical entry sequence, so the successor exists for every log this
+    // deployment can hold; a store large enough to make it overflow could not be addressed.
+    let genesis_tree_size = genesis_entry_index
+        .checked_add(1)
+        .ok_or(MirrorError::IndexOverflow { what: "genesis_entry_index" })?;
+    let Some(genesis_governance) = resolve_governance_for(store, config, genesis_tree_size)? else {
         return Ok(GapFreeResult {
             frontier: None,
-            stop: Some(FrontierStop::GovernanceUnresolvable {
-                at_tree_size: genesis_entry_index + 1,
-            }),
+            stop: Some(FrontierStop::GovernanceUnresolvable { at_tree_size: genesis_tree_size }),
         });
     };
     let epoch_nanos = genesis_governance.cadence_epoch_nanos();
@@ -587,8 +654,10 @@ fn compute_gap_free_frontier(
     // interval the corpus did not exist for) nor later (leaving the opening interval
     // unjudged) is valid; the genesis checkpoint's `tree_size` plays no role in this check.
     let first_time = parse_checkpoint_time(&first.checkpoint_time)?;
+    // `checked_sub` carries the "not earlier than the epoch" half of the window test: `None`
+    // is exactly `first_time < epoch_nanos`.
     let starts_within_epoch_window =
-        first_time >= epoch_nanos && first_time - epoch_nanos <= genesis_cadence_nanos;
+        first_time.checked_sub(epoch_nanos).is_some_and(|since| since <= genesis_cadence_nanos);
     if !starts_within_epoch_window {
         return Ok(GapFreeResult { frontier: None, stop: Some(FrontierStop::NoValidStart) });
     }
@@ -596,26 +665,28 @@ fn compute_gap_free_frontier(
     let mut frontier = first.tree_size;
     let mut prev = first;
     let mut prev_time = first_time;
-    for cp in &usable[1..] {
+    // `first` was taken off the front above, so the remaining members start at index 1.
+    for cp in usable.iter().skip(1) {
         if let Some(floor) = equivocation_floor {
             if cp.tree_size >= floor {
                 return Ok(GapFreeResult { frontier: Some(frontier), stop: equivocation_stop });
             }
         }
         let cp_time = parse_checkpoint_time(&cp.checkpoint_time)?;
-        if cp_time < prev_time {
+        // `checked_sub` is also the monotonicity test: `None` is exactly `cp_time <
+        // prev_time`, which stops the series here rather than measuring a cadence backwards.
+        let Some(delta) = cp_time.checked_sub(prev_time) else {
             return Ok(GapFreeResult {
                 frontier: Some(frontier),
                 stop: Some(FrontierStop::DecreasingTime { after_tree_size: prev.tree_size }),
             });
-        }
+        };
         let Some(prev_governance) = resolve_governance_for(store, config, prev.tree_size)? else {
             return Ok(GapFreeResult {
                 frontier: Some(frontier),
                 stop: Some(FrontierStop::GovernanceUnresolvable { at_tree_size: prev.tree_size }),
             });
         };
-        let delta = cp_time - prev_time;
         if delta > prev_governance.cadence_nanos() {
             return Ok(GapFreeResult {
                 frontier: Some(frontier),
@@ -764,6 +835,21 @@ mod tests {
         assert!(parse_checkpoint_time("2026-01-01T00:00:00.123Z").is_err());
         assert!(parse_checkpoint_time("2026-01-01T00:00:00Z").is_err());
         assert!(parse_checkpoint_time("not-a-time").is_err());
+    }
+
+    #[test]
+    fn a_non_digit_in_the_subsecond_field_is_rejected_not_a_panic() {
+        // Found by the `text` and `checkpoint` fuzz targets. The datetime parser's subsecond
+        // combinator is told to expect nine digits and derives a width by subtracting what it
+        // consumed, which underflows on anything shorter — so these reached an abort rather
+        // than a rejection before the shape check ran first. `checkpoint_time` comes out of a
+        // request body, so this is an ordinary input to `POST /v1/checkpoints`.
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.0000&0000Z").is_err());
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.000&0000Z").is_err());
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.00+0000000Z").is_err());
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.        Z").is_err());
+        // A well-formed value still parses, and still round-trips.
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.000000000Z").is_ok());
     }
 
     #[test]

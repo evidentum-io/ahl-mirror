@@ -1,0 +1,8 @@
+{
+  "entry_id": "sha256:f2ab1997e2c03ca79cd0f683e4dbba3340e59ddc8ec1d9ebc5389f35fc743662",
+  "inclusion_path": [
+    "sha256:abababababababababababababababababababababababababababababababab"
+  ],
+  "leaf_index": 18446744073709551615,
+  "tree_size": 1
+}

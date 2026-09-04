@@ -476,6 +476,118 @@ async fn consistency_handler(
     })))
 }
 
+#[cfg(feature = "fuzzing")]
+pub mod seam {
+    //! Synchronous entry points onto this module's request parsers, for the fuzz harness in
+    //! `fuzz/`.
+    //!
+    //! Each function takes the bytes a client sends and runs exactly what the corresponding
+    //! handler runs: the same private request type, the same field decoding, and the same
+    //! library call — minus `axum`'s routing and the `spawn_blocking` hop, neither of which
+    //! parses anything. The request types are private because they are wire shapes rather
+    //! than API, so a fuzz target cannot name them; this module is the narrowest way to reach
+    //! them without publishing them. Off by default, and the API it adds carries no stability
+    //! promise.
+    //!
+    //! Every function returns `true` if the body parsed and the library call was reached, so
+    //! a target can tell an early reject apart from a completed run. Errors are outcomes, not
+    //! failures: the property under test is that neither ever panics.
+
+    use axum::extract::Query;
+    use axum::http::Uri;
+
+    use super::{
+        decode_base64_field, series_usable_checkpoint, CheckpointIngestRequest, ConsistencyQuery,
+        PromoteRequest, RangeRequest, RetrieveQuery, StageRequest,
+    };
+    use crate::config::Config;
+    use crate::error::MirrorError;
+    use crate::store::Store;
+
+    /// `POST /v1/entries/stage`.
+    pub fn stage(store: &Store, body: &[u8]) -> bool {
+        let Ok(req) = serde_json::from_slice::<StageRequest>(body) else { return false };
+        let Ok(bytes) = decode_base64_field(&req.envelope_base64, "envelope_base64") else {
+            return false;
+        };
+        let _ = crate::ingest::stage_entry(store, &req.entry_id, &bytes, &req.atl_metadata);
+        true
+    }
+
+    /// `POST /v1/entries/promote`.
+    pub fn promote(store: &Store, body: &[u8]) -> bool {
+        let Ok(req) = serde_json::from_slice::<PromoteRequest>(body) else { return false };
+        let _ = store.get_checkpoint(req.tree_size).map(|found| {
+            found.map(|checkpoint| {
+                crate::ingest::promote_entry(
+                    store,
+                    &checkpoint,
+                    &req.entry_id,
+                    req.leaf_index,
+                    &req.inclusion_path,
+                )
+            })
+        });
+        true
+    }
+
+    /// `POST /v1/range`.
+    pub fn range(store: &Store, config: &Config, body: &[u8]) -> bool {
+        let Ok(req) = serde_json::from_slice::<RangeRequest>(body) else { return false };
+        let Ok(checkpoint) = series_usable_checkpoint(store, config, req.tree_size) else {
+            return true;
+        };
+        let Ok(all_entries) = store.get_entries_range(0, checkpoint.tree_size) else {
+            return true;
+        };
+        let _ = crate::range::build_range_response(
+            &checkpoint,
+            req.from_index,
+            req.to_index,
+            &all_entries,
+        );
+        true
+    }
+
+    /// `POST /v1/checkpoints`.
+    pub fn checkpoint_ingest(store: &Store, config: &Config, body: &[u8]) -> bool {
+        let Ok(req) = serde_json::from_slice::<CheckpointIngestRequest>(body) else {
+            return false;
+        };
+        let raw = match req.raw.as_deref().map(|value| decode_base64_field(value, "raw")) {
+            Some(Ok(bytes)) => Some(bytes),
+            Some(Err(_)) => return false,
+            None => None,
+        };
+        let _ = crate::checkpoint::ingest_checkpoint(
+            store,
+            config,
+            &req.checkpoint,
+            raw.as_deref(),
+            &req.entries_to_promote,
+        );
+        true
+    }
+
+    /// `GET /v1/entries/{entry_id}?encoding=…`: the path segment and the query string.
+    pub fn retrieve(store: &Store, entry_id: &str, query: &str) -> bool {
+        let Ok(uri) = format!("/?{query}").parse::<Uri>() else { return false };
+        let Ok(Query(parsed)) = Query::<RetrieveQuery>::try_from_uri(&uri) else { return false };
+        let _base64_form = parsed.encoding.as_deref() == Some("base64");
+        let _ = crate::retrieval::retrieve_by_id(store, entry_id);
+        true
+    }
+
+    /// `GET /v1/consistency?from=…&to=…`.
+    pub fn consistency(store: &Store, config: &Config, query: &str) -> bool {
+        let Ok(uri) = format!("/?{query}").parse::<Uri>() else { return false };
+        let Ok(Query(parsed)) = Query::<ConsistencyQuery>::try_from_uri(&uri) else { return false };
+        let _: Result<_, MirrorError> = series_usable_checkpoint(store, config, parsed.from);
+        let _: Result<_, MirrorError> = series_usable_checkpoint(store, config, parsed.to);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use atl_core::core::merkle::Hash;
@@ -938,6 +1050,29 @@ mod tests {
         assert_eq!(submit_checkpoint(&app, &cp, &[]).await, StatusCode::BAD_REQUEST);
     }
 
+    /// A checkpoint may claim any `tree_size` it likes, and the claim is read before its
+    /// signature is verified. Sizing an allocation by that claim let an unauthenticated
+    /// `POST /v1/checkpoints` abort the process: `i64::MAX` overflowed the capacity
+    /// computation outright, and merely large values exhausted memory first. Both are
+    /// rejections now, and the work stays proportional to the entries actually held.
+    #[tokio::test]
+    async fn an_oversized_tree_size_claim_is_rejected_not_allocated_for() {
+        let hx = harness();
+        let app = router(hx.state.clone());
+        for tree_size in [u64::try_from(i64::MAX).expect("positive"), 1u64 << 40, u64::MAX] {
+            let cp = crate::checkpoint::Checkpoint {
+                log_id: hx.log_id.clone(),
+                tree_size,
+                root_hash: format!("sha256:{}", hex::encode(hx.genesis_leaf)),
+                checkpoint_time: "2026-01-01T00:00:00.000000000Z".to_owned(),
+                key_id: hx.log_key.key_id(),
+                signature: "base64:AAAA".to_owned(),
+            };
+            let status = submit_checkpoint(&app, &cp, &[]).await;
+            assert!(status.is_client_error(), "tree_size {tree_size} gave {status}");
+        }
+    }
+
     #[tokio::test]
     async fn a_checkpoint_signed_outside_its_key_validity_range_is_a_400() {
         // The "checkpoint signed by a key outside its validity range" negative test,
@@ -1122,5 +1257,80 @@ mod tests {
             Request::get("/v1/consistency?from=0&to=5").body(Body::empty()).expect("valid request");
         let response = app.oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The fuzz seam runs the same parsers the handlers above run, so it is exercised the
+    /// same way once each: a body a client would send, and bytes no client would send.
+    #[cfg(feature = "fuzzing")]
+    mod seam {
+        use super::super::seam;
+        use super::*;
+
+        /// The same unauthenticated oversized-claim input, driven through the seam the
+        /// `checkpoint` fuzz target uses, so a regression is caught by the harness too.
+        #[test]
+        fn an_oversized_tree_size_claim_does_not_abort_the_seam() {
+            let fx = harness();
+            for tree_size in [u64::try_from(i64::MAX).expect("positive"), 1u64 << 40, u64::MAX] {
+                let body = json!({ "checkpoint": {
+                    "log_id": fx.log_id.clone(),
+                    "tree_size": tree_size,
+                    "root_hash": format!("sha256:{}", hex::encode(fx.genesis_leaf)),
+                    "checkpoint_time": "2026-01-01T00:00:00.000000000Z",
+                    "key_id": fx.log_key.key_id(),
+                    "signature": "base64:AAAA",
+                }});
+                assert!(seam::checkpoint_ingest(
+                    &fx.state.store,
+                    &fx.state.config,
+                    &serde_json::to_vec(&body).expect("serialize")
+                ));
+            }
+        }
+
+        #[test]
+        fn every_seam_entry_point_parses_a_request_and_refuses_garbage() {
+            let fx = harness();
+            let store = &fx.state.store;
+            let config = &fx.state.config;
+            let bytes = envelope_bytes(1);
+            let entry_id = entry_id_of(&bytes);
+
+            let stage_body = json!({
+                "entry_id": entry_id,
+                "envelope_base64": format!("base64:{}", B64.encode(&bytes)),
+                "atl_metadata": adaptor_metadata_object(),
+            });
+            assert!(seam::stage(store, &serde_json::to_vec(&stage_body).expect("serialize")));
+
+            let promote_body = json!({ "entry_id": entry_id, "tree_size": 1, "leaf_index": 0,
+                        "inclusion_path": [] });
+            assert!(seam::promote(store, &serde_json::to_vec(&promote_body).expect("serialize")));
+
+            let range_body = json!({ "tree_size": 1, "from_index": 0, "to_index": 1 });
+            assert!(seam::range(
+                store,
+                config,
+                &serde_json::to_vec(&range_body).expect("serialize")
+            ));
+
+            let (cp, _) = signed_checkpoint_for(&fx, &[], "2026-01-01T00:01:00.000000000Z", false);
+            let ingest_body = json!({ "checkpoint": cp });
+            assert!(seam::checkpoint_ingest(
+                store,
+                config,
+                &serde_json::to_vec(&ingest_body).expect("serialize")
+            ));
+
+            assert!(seam::retrieve(store, &entry_id, "encoding=base64"));
+            assert!(seam::consistency(store, config, "from=0&to=1"));
+
+            // Nothing here parses, and nothing here aborts.
+            assert!(!seam::stage(store, b"\xff\xfe"));
+            assert!(!seam::promote(store, b"{"));
+            assert!(!seam::range(store, config, b"[]"));
+            assert!(!seam::checkpoint_ingest(store, config, b"null"));
+            assert!(!seam::consistency(store, config, "from=&to="));
+        }
     }
 }

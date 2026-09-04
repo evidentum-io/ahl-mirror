@@ -158,7 +158,13 @@ fn take_component(input: &str, unit: char) -> MirrorResult<Option<(u64, &str)>> 
     }
     let n: u64 =
         digits.parse().map_err(|_| MirrorError::BadDuration { value: input.to_owned() })?;
-    Ok(Some((n, &input[pos + 1..])))
+    // The remainder starts one character past `unit`. `len_utf8` rather than a literal 1 so
+    // the split stays on a character boundary whatever `unit` is; `find` returned `pos`, so
+    // the sum is at most `input.len()` and the lookup always succeeds.
+    let rest = input
+        .get(pos.saturating_add(unit.len_utf8())..)
+        .ok_or_else(|| MirrorError::BadDuration { value: input.to_owned() })?;
+    Ok(Some((n, rest)))
 }
 
 #[cfg(test)]

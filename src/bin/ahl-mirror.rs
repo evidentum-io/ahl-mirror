@@ -7,9 +7,13 @@
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
     clippy::panic,
+    clippy::unreachable,
     clippy::todo,
-    clippy::unimplemented
+    clippy::unimplemented,
+    clippy::missing_panics_doc
 )]
 // See ahl-core's Cargo.toml and this crate's lib.rs for the rationale: transitive deps pull
 // both syn 2.x/3.x and thiserror 1.x/2.x. Not actionable from this binary.

@@ -355,7 +355,14 @@ fn build_visible_prefix(
         }
         let idx = usize::try_from(p.leaf_index)
             .map_err(|_| MirrorError::IndexOverflow { what: "leaf_index" })?;
-        if slots[idx].is_some() {
+        // `slots` has exactly `target_usize` elements and the guard above established
+        // `p.leaf_index < target_tree_size`, so the slot is present. Reading and writing it
+        // through the one `get_mut` keeps that reasoning next to the access rather than
+        // spread over two bare indexings.
+        let Some(slot) = slots.get_mut(idx) else {
+            return Err(MirrorError::IndexOverflow { what: "leaf_index" });
+        };
+        if slot.is_some() {
             continue; // already canonical; a tentative duplicate is not consulted
         }
         let bytes = store
@@ -374,7 +381,7 @@ fn build_visible_prefix(
                 tree_size: target_tree_size,
             });
         }
-        slots[idx] = Some(bytes);
+        *slot = Some(bytes);
     }
 
     let mut result = Vec::with_capacity(target_usize);
@@ -569,13 +576,16 @@ fn compute_gap_free_frontier(
         });
     };
     let genesis_entry_index = first_governance.genesis_entry_index();
-    let Some(genesis_governance) = resolve_governance_for(store, config, genesis_entry_index + 1)?
-    else {
+    // The genesis checkpoint's `tree_size`. `genesis_entry_index` is a position in this
+    // store's own canonical entry sequence, so the successor exists for every log this
+    // deployment can hold; a store large enough to make it overflow could not be addressed.
+    let genesis_tree_size = genesis_entry_index
+        .checked_add(1)
+        .ok_or(MirrorError::IndexOverflow { what: "genesis_entry_index" })?;
+    let Some(genesis_governance) = resolve_governance_for(store, config, genesis_tree_size)? else {
         return Ok(GapFreeResult {
             frontier: None,
-            stop: Some(FrontierStop::GovernanceUnresolvable {
-                at_tree_size: genesis_entry_index + 1,
-            }),
+            stop: Some(FrontierStop::GovernanceUnresolvable { at_tree_size: genesis_tree_size }),
         });
     };
     let epoch_nanos = genesis_governance.cadence_epoch_nanos();
@@ -587,8 +597,10 @@ fn compute_gap_free_frontier(
     // interval the corpus did not exist for) nor later (leaving the opening interval
     // unjudged) is valid; the genesis checkpoint's `tree_size` plays no role in this check.
     let first_time = parse_checkpoint_time(&first.checkpoint_time)?;
+    // `checked_sub` carries the "not earlier than the epoch" half of the window test: `None`
+    // is exactly `first_time < epoch_nanos`.
     let starts_within_epoch_window =
-        first_time >= epoch_nanos && first_time - epoch_nanos <= genesis_cadence_nanos;
+        first_time.checked_sub(epoch_nanos).is_some_and(|since| since <= genesis_cadence_nanos);
     if !starts_within_epoch_window {
         return Ok(GapFreeResult { frontier: None, stop: Some(FrontierStop::NoValidStart) });
     }
@@ -596,26 +608,28 @@ fn compute_gap_free_frontier(
     let mut frontier = first.tree_size;
     let mut prev = first;
     let mut prev_time = first_time;
-    for cp in &usable[1..] {
+    // `first` was taken off the front above, so the remaining members start at index 1.
+    for cp in usable.iter().skip(1) {
         if let Some(floor) = equivocation_floor {
             if cp.tree_size >= floor {
                 return Ok(GapFreeResult { frontier: Some(frontier), stop: equivocation_stop });
             }
         }
         let cp_time = parse_checkpoint_time(&cp.checkpoint_time)?;
-        if cp_time < prev_time {
+        // `checked_sub` is also the monotonicity test: `None` is exactly `cp_time <
+        // prev_time`, which stops the series here rather than measuring a cadence backwards.
+        let Some(delta) = cp_time.checked_sub(prev_time) else {
             return Ok(GapFreeResult {
                 frontier: Some(frontier),
                 stop: Some(FrontierStop::DecreasingTime { after_tree_size: prev.tree_size }),
             });
-        }
+        };
         let Some(prev_governance) = resolve_governance_for(store, config, prev.tree_size)? else {
             return Ok(GapFreeResult {
                 frontier: Some(frontier),
                 stop: Some(FrontierStop::GovernanceUnresolvable { at_tree_size: prev.tree_size }),
             });
         };
-        let delta = cp_time - prev_time;
         if delta > prev_governance.cadence_nanos() {
             return Ok(GapFreeResult {
                 frontier: Some(frontier),

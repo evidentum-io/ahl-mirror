@@ -513,11 +513,11 @@ fn rotations_in(versions: &[GovernanceState]) -> Vec<Rotation<'_>> {
 ///    key of the OUTGOING log key set — the log key objects of the manifest version preceding
 ///    the rotating one".
 ///
-/// `named` is the `manifest_entry_index` a submission asserted. Where it is given, only that
-/// rotation is considered and a failure to qualify is an error naming why, so a submitter that
-/// says what its checkpoint is for is told when the deployment disagrees; where it is absent the
-/// server detects every rotation the checkpoint qualifies for and reports an empty list rather
-/// than an error, since a plain series checkpoint anchoring nothing is the ordinary case.
+/// `named` is the `manifest_entry_index` a submission asserted. It NARROWS NOTHING: every
+/// rotation the checkpoint qualifies for is discovered and returned either way, because what a
+/// checkpoint anchors is a fact about the log and not about what the submitter happened to know.
+/// What naming changes is the report — a name absent from the discovered set is an error saying
+/// why, rather than an admission that quietly anchors something else.
 ///
 /// This is STRICTLY HARDER to satisfy than the general rule, which is why §7.1 calls it safe:
 /// the general rule would accept the INCOMING key, "exactly the key an attacker installs",
@@ -530,35 +530,34 @@ fn rotation_anchors_for(
     named: Option<u64>,
 ) -> MirrorResult<Vec<u64>> {
     let mut anchored = Vec::new();
-    let mut named_reason: Option<&'static str> = None;
+    let mut named_failure: Option<&'static str> = None;
     for rotation in rotations_in(versions) {
-        if named.is_some_and(|index| index != rotation.manifest_entry_index) {
-            continue;
-        }
-        if cp.tree_size <= rotation.manifest_entry_index {
-            named_reason =
-                Some("the checkpoint's tree_size is not greater than the manifest entry index");
-            continue;
-        }
-        let verified = rotation
+        let index = rotation.manifest_entry_index;
+        let qualifies = if cp.tree_size <= index {
+            Err("the checkpoint's tree_size is not greater than the manifest entry index")
+        } else if rotation
             .outgoing
             .resolve_log_key(&cp.key_id, cp.tree_size)
-            .and_then(|key| verify_checkpoint_signature(cp, raw, &config.log_id, key));
-        if verified.is_err() {
-            named_reason = Some(
-                "the checkpoint does not verify under a log key of the version preceding the \
-                 rotating one",
-            );
-            continue;
+            .and_then(|key| verify_checkpoint_signature(cp, raw, &config.log_id, key))
+            .is_err()
+        {
+            Err("the checkpoint does not verify under a log key of the version preceding the \
+                 rotating one")
+        } else {
+            Ok(())
+        };
+        match qualifies {
+            Ok(()) => anchored.push(index),
+            Err(reason) if named == Some(index) => named_failure = Some(reason),
+            Err(_) => {}
         }
-        anchored.push(rotation.manifest_entry_index);
     }
     if let Some(manifest_entry_index) = named {
-        if anchored.is_empty() {
+        if !anchored.contains(&manifest_entry_index) {
             return Err(MirrorError::NotRotationMaterial {
                 tree_size: cp.tree_size,
                 manifest_entry_index,
-                reason: named_reason.unwrap_or(
+                reason: named_failure.unwrap_or(
                     "the manifest version at that entry index is not a governance-key rotation \
                      of its predecessor",
                 ),
@@ -1536,6 +1535,28 @@ mod tests {
             fx.admit(&cp, Some(0)),
             Err(MirrorError::NotRotationMaterial { manifest_entry_index: 0, .. })
         ));
+    }
+
+    /// Naming a rotation NARROWS NOTHING. A checkpoint under an unchanged log key can anchor
+    /// several witness-set rotations at once, and it anchors all of them whether the submitter
+    /// named one, another, or none: what a checkpoint anchors is a fact about the log, not about
+    /// what the submitter knew. Storing only the named one would leave the others' proofs
+    /// unheld while reporting success.
+    #[test]
+    fn naming_one_rotation_still_anchors_every_rotation_the_checkpoint_fits() {
+        // The log key is held still across three versions while the witness key moves twice:
+        // two governance-key rotations, at entry indexes 1 and 2, and one checkpoint under the
+        // unchanged log key qualifies for both.
+        let fx = chain_fixture(0x90, &[(0x91, 0x92), (0x91, 0x93), (0x91, 0x94)]);
+        let cp = fx.signed_by(2, "2026-01-01T00:02:00.000000000Z");
+
+        assert_eq!(
+            fx.admit(&cp, Some(1)).expect("named one of the two"),
+            Admission { series_member: true, rotation_anchors: vec![1, 2] },
+            "both rotations are anchored, and the report names both"
+        );
+        assert_eq!(fx.store.get_rotation_checkpoint(1).expect("query"), Some(cp.clone()));
+        assert_eq!(fx.store.get_rotation_checkpoint(2).expect("query"), Some(cp));
     }
 
     /// I-D §7.1 requires a rotation proof's `tree_size` to be GREATER than

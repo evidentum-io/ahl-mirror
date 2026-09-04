@@ -303,8 +303,7 @@ async fn range_handler(
     .await?;
 
     let response = blocking(move || {
-        let all_entries = store.get_entries_range(0, checkpoint.tree_size)?;
-        crate::range::build_range_response(&checkpoint, req.from_index, req.to_index, &all_entries)
+        crate::range::build_range_response(&store, &checkpoint, req.from_index, req.to_index)
     })
     .await?;
 
@@ -539,15 +538,8 @@ pub mod seam {
         let Ok(checkpoint) = series_usable_checkpoint(store, config, req.tree_size) else {
             return true;
         };
-        let Ok(all_entries) = store.get_entries_range(0, checkpoint.tree_size) else {
-            return true;
-        };
-        let _ = crate::range::build_range_response(
-            &checkpoint,
-            req.from_index,
-            req.to_index,
-            &all_entries,
-        );
+        let _ =
+            crate::range::build_range_response(store, &checkpoint, req.from_index, req.to_index);
         true
     }
 

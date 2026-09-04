@@ -1235,4 +1235,57 @@ mod tests {
         let response = app.oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    /// The fuzz seam runs the same parsers the handlers above run, so it is exercised the
+    /// same way once each: a body a client would send, and bytes no client would send.
+    #[cfg(feature = "fuzzing")]
+    mod seam {
+        use super::super::seam;
+        use super::*;
+
+        #[test]
+        fn every_seam_entry_point_parses_a_request_and_refuses_garbage() {
+            let fx = harness();
+            let store = &fx.state.store;
+            let config = &fx.state.config;
+            let bytes = envelope_bytes(1);
+            let entry_id = entry_id_of(&bytes);
+
+            let stage_body = json!({
+                "entry_id": entry_id,
+                "envelope_base64": format!("base64:{}", B64.encode(&bytes)),
+                "atl_metadata": adaptor_metadata_object(),
+            });
+            assert!(seam::stage(store, &serde_json::to_vec(&stage_body).expect("serialize")));
+
+            let promote_body = json!({ "entry_id": entry_id, "tree_size": 1, "leaf_index": 0,
+                        "inclusion_path": [] });
+            assert!(seam::promote(store, &serde_json::to_vec(&promote_body).expect("serialize")));
+
+            let range_body = json!({ "tree_size": 1, "from_index": 0, "to_index": 1 });
+            assert!(seam::range(
+                store,
+                config,
+                &serde_json::to_vec(&range_body).expect("serialize")
+            ));
+
+            let (cp, _) = signed_checkpoint_for(&fx, &[], "2026-01-01T00:01:00.000000000Z", false);
+            let ingest_body = json!({ "checkpoint": cp });
+            assert!(seam::checkpoint_ingest(
+                store,
+                config,
+                &serde_json::to_vec(&ingest_body).expect("serialize")
+            ));
+
+            assert!(seam::retrieve(store, &entry_id, "encoding=base64"));
+            assert!(seam::consistency(store, config, "from=0&to=1"));
+
+            // Nothing here parses, and nothing here aborts.
+            assert!(!seam::stage(store, b"\xff\xfe"));
+            assert!(!seam::promote(store, b"{"));
+            assert!(!seam::range(store, config, b"[]"));
+            assert!(!seam::checkpoint_ingest(store, config, b"null"));
+            assert!(!seam::consistency(store, config, "from=&to="));
+        }
+    }
 }

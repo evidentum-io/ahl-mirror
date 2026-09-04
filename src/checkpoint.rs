@@ -189,6 +189,35 @@ pub fn render_checkpoint_time(nanos: u64) -> MirrorResult<String> {
         .map_err(|_| MirrorError::BadCheckpointTime { value: nanos.to_string() })
 }
 
+/// The exact byte positions of the seven literal characters in the rendering adaptor profile
+/// §6.3 fixes, `YYYY-MM-DDTHH:MM:SS.fffffffffZ`.
+const CHECKPOINT_TIME_LITERALS: [(usize, u8); 7] =
+    [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'.'), (29, b'Z')];
+
+/// The length of that rendering.
+const CHECKPOINT_TIME_LEN: usize = 30;
+
+/// Whether `value` has exactly that shape: thirty ASCII characters, the seven literals in
+/// their fixed positions, and a digit everywhere else — nine of them in the subsecond field.
+///
+/// Checked before `value` reaches the datetime parser rather than left to it. That parser's
+/// subsecond combinator is told to expect exactly nine digits and derives a width by
+/// subtraction from the digits it actually consumed, which underflows when it is handed
+/// fewer — so a value of the wrong shape must never reach it. `checkpoint_time` arrives in a
+/// request body, so the wrong shape is an ordinary input, not a remote possibility.
+fn has_profile_time_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != CHECKPOINT_TIME_LEN {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(at, byte)| {
+        CHECKPOINT_TIME_LITERALS
+            .iter()
+            .find_map(|(position, literal)| (*position == at).then_some(*byte == *literal))
+            .unwrap_or_else(|| byte.is_ascii_digit())
+    })
+}
+
 /// Parse `checkpoint_time` to its exact unix-nanosecond value.
 ///
 /// Rejects anything that is not exactly the rendering adaptor profile §6.3 specifies —
@@ -202,6 +231,9 @@ pub fn render_checkpoint_time(nanos: u64) -> MirrorResult<String> {
 /// round-trip back to itself.
 pub fn parse_checkpoint_time(value: &str) -> MirrorResult<u64> {
     let bad = || MirrorError::BadCheckpointTime { value: value.to_owned() };
+    if !has_profile_time_shape(value) {
+        return Err(bad());
+    }
     let parsed = PrimitiveDateTime::parse(value, CHECKPOINT_TIME_FORMAT).map_err(|_| bad())?;
     let nanos = parsed.assume_utc().unix_timestamp_nanos();
     let nanos = u64::try_from(nanos).map_err(|_| bad())?;
@@ -778,6 +810,21 @@ mod tests {
         assert!(parse_checkpoint_time("2026-01-01T00:00:00.123Z").is_err());
         assert!(parse_checkpoint_time("2026-01-01T00:00:00Z").is_err());
         assert!(parse_checkpoint_time("not-a-time").is_err());
+    }
+
+    #[test]
+    fn a_non_digit_in_the_subsecond_field_is_rejected_not_a_panic() {
+        // Found by the `text` and `checkpoint` fuzz targets. The datetime parser's subsecond
+        // combinator is told to expect nine digits and derives a width by subtracting what it
+        // consumed, which underflows on anything shorter — so these reached an abort rather
+        // than a rejection before the shape check ran first. `checkpoint_time` comes out of a
+        // request body, so this is an ordinary input to `POST /v1/checkpoints`.
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.0000&0000Z").is_err());
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.000&0000Z").is_err());
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.00+0000000Z").is_err());
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.        Z").is_err());
+        // A well-formed value still parses, and still round-trips.
+        assert!(parse_checkpoint_time("2026-01-01T00:01:00.000000000Z").is_ok());
     }
 
     #[test]

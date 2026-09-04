@@ -80,11 +80,11 @@ A library (`src/lib.rs` and siblings) plus a thin binary (`src/bin/ahl-mirror.rs
 | --- | --- |
 | `metadata` | the fixed ATL adaptor metadata object (§4.2) and the log-tree leaf hash |
 | `duration` | ISO 8601 duration parsing for `checkpoint_cadence`/`witness_grace_period` |
-| `store` | durable storage — staged and canonical entries, the authenticated checkpoint set |
+| `store` | durable storage — staged and canonical entries with their log leaf hashes, the complete-subtree cache, the authenticated checkpoint set, and rotation-anchoring checkpoints held apart from it |
 | `ingest` | the format checks a submitted entry must pass to be staged, and proof-gated promotion to canonical storage |
 | `manifest` | the verified governance chain walk: producer-signature and `predecessor` checks, checkpoint-signing key and cadence resolution |
 | `retrieval` | retrieval by entry id (§10.1.1), with a defensive re-hash before serving |
-| `range` | range-proof generation, `AHLRP1` serialization, and offline verification |
+| `range` | range-proof generation from stored tree material, `AHLRP1` serialization, and offline verification |
 | `checkpoint` | checkpoint parsing/signing, the authenticated/series-usable state machine, gap-free-frontier computation, `ITUB` |
 | `config` | the log this mirror serves and the genesis governance anchor it bootstraps from |
 | `http` | an `axum` router — thin handlers over the modules above, nothing more |
@@ -183,6 +183,40 @@ not needed.
   governance chain still cannot be resolved that far — nothing canonical or proof-verified
   reaches a verified genesis — admission is refused (`GovernanceChainUnresolvable`) rather
   than falling back to a stale or partial snapshot.
+- **Range enumeration that reads the window and not the log** (adaptor profile §10.3-§10.5).
+  A range proof carries the subtree hashes covering everything outside the requested window,
+  so a naive builder hashes the whole `[0, tree_size)` prefix to produce them. This one does
+  not. Each entry's ATL log leaf hash (§4.2) is stored beside it at promotion, and the root of
+  every **complete** power-of-two subtree is stored as it becomes complete (RFC 6962 geometry),
+  so every proof node is one stored hash or an `O(log n)` fold over stored hashes, and entry
+  BYTES are read for `[from_index, to_index)` and for nothing else. An existing store is
+  migrated on open: the leaf-hash column is backfilled once and the subtree cache is rebuilt
+  wherever it does not hold exactly the nodes a log of the stored size completes. The response
+  bytes are unchanged — `range::build_range_response_from_prefix`, the previous full-prefix
+  builder, is retained as a test oracle and
+  `the_windowed_builder_agrees_with_a_full_prefix_build` holds the two together over every
+  window of every tree shape up to 33 entries. Measured on a 10-entry window over a
+  10 000-entry log: **778 890 bytes read before, 1 772 after** (780 entry bytes plus 31 stored
+  32-octet tree nodes), and `build_range_response_measured` reports that figure rather than
+  leaving it to be asserted.
+- **Rotation-anchoring checkpoints, held under the outgoing state and served apart**
+  (I-D §7.1's transition exception; adaptor profile §16 item 10). A submitted checkpoint whose
+  signature does not verify under the manifest version active for its own `tree_size` is
+  retried under one rule and one only: the active version must be a **governance-key
+  rotation** — its log key objects or its witness key objects differ from its predecessor's —
+  the checkpoint's `tree_size` must be GREATER than that version's entry index, and the
+  signature must verify under a log key of the PREDECESSOR version's set. Nothing else is ever
+  accepted under a retired key, and a checkpoint that fails this second test is refused with
+  the failure it earned under the ordinary rule. Material so admitted is stored in its own
+  table, is never returned as a series member (`GET /v1/checkpoints`, `/v1/checkpoints/{size}`,
+  `ITUB`, consistency neighbours), and is served only from
+  `GET /v1/rotation-proofs/{manifest_entry_index}`, in the `governance.rotation_proofs[]`
+  element shape §7.1 defines — `{manifest_entry_index, checkpoint, inclusion_path, witnesses}`.
+  `witnesses` is always empty: a mirror does not cosign, so a deployment claiming L3 fills that
+  member from its witness before the element goes into a receipt. Held apart is not held
+  outside the rules: a rotation-anchoring checkpoint that contradicts a series member at the
+  same `tree_size` is equivocation and is reported through the same path as any other
+  divergence (core spec §7.3), which the rotation route then refuses to serve past.
 - **Two verification states, enforced as a real boundary, not a label** (core spec §7.3).
   `ingest_checkpoint` records every signature-verified checkpoint as **authenticated**;
   `checkpoint::series_view` computes, fresh on every call from the store's current state,
@@ -368,6 +402,7 @@ ahl-mirror --config mirror.json --listen 127.0.0.1:8080
 | `POST` | `/v1/checkpoints` | admit a checkpoint as authenticated (core spec §7.3), optionally with `entries_to_promote` to admit its entries — and any governance material they carry — in the same call |
 | `GET` | `/v1/checkpoints` | every authenticated checkpoint, each labelled with its state |
 | `GET` | `/v1/checkpoints/{tree_size}` | the most recently declared checkpoint at that size, with its state |
+| `GET` | `/v1/rotation-proofs/{manifest_entry_index}` | the `governance.rotation_proofs[]` element for the governance-key rotation anchored at that entry index (I-D §7.1); `404` where none is held |
 | `GET` | `/v1/itub/{index}` | `ITUB(index)`, gap-free-frontier-aware (core spec §7.3; adaptor profile §5.2.1) |
 | `GET` | `/v1/consistency?from=&to=` | a consistency proof between two series-usable members |
 | `GET` | `/health` | liveness |

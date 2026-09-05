@@ -67,12 +67,18 @@
 //!
 //! Every root and every proof this crate computes is opened through those two and nothing
 //! else — `subtree_root_raw` and `log_root_raw` for a root, `inclusion_proof_raw` for an RFC
-//! 6962 inclusion path, `consistency_proof_measured_raw` for an RFC 9162 consistency path
-//! (the `&Connection` cores below, surfaced as [`Store::subtree_root`], [`Store::log_root`],
-//! [`Store::inclusion_proof`] and [`Store::consistency_proof`]). No caller re-derives a leaf
-//! hash from entry bytes to answer a question about the tree: entry bytes are read to be
-//! **served** (retrieval, an enumeration window) and to be **parsed** (the governance chain's
-//! `manifest`/`key` statements), never to rebuild a root.
+//! 6962 inclusion path, `consistency_proof_measured_raw` for an RFC 9162 consistency path. No
+//! caller re-derives a leaf hash from entry bytes to answer a question about the tree: entry
+//! bytes are read to be **served** (retrieval, an enumeration window) and to be **parsed**
+//! (the governance chain's `manifest`/`key` statements), never to rebuild a root.
+//!
+//! Which makes an absent cache row a fault, not a slow path. A node that is COMPLETE under
+//! the tree being opened is one this store promised to hold, so `with_tree_nodes` raises
+//! [`MirrorError::TreeMaterialMissing`] rather than letting `atl_core` descend and rebuild
+//! that subtree from leaf hashes: the caller was promised `O(log n)` reads, and material this
+//! deployment cannot vouch for is refused rather than quietly reconstructed. `rebuild_subtree_cache`
+//! is the remedy and runs on open (see the migration below), never inside a request; a
+//! serving path only ever CHECKS (`require_subtree_cache_raw`).
 //!
 //! Concurrency: the store serializes all access behind one connection and one mutex.
 //! Governance resolution and signature verification (read-only) happen before any write; the
@@ -457,19 +463,6 @@ impl Store {
         self.with_conn(|conn| subtree_root_raw(conn, offset, size))
     }
 
-    /// The RFC 6962 root of the whole stored prefix `[0, tree_size)`, opened through the
-    /// stored complete-subtree roots — `O(log tree_size)` node reads, no entry bytes. A
-    /// `tree_size` of zero is the empty tree, whose root is `SHA-256("")`.
-    ///
-    /// # Errors
-    ///
-    /// [`MirrorError::Atl`] if the prefix is not inside the stored material,
-    /// [`MirrorError::TreeMaterialMissing`]/[`MirrorError::TreeMaterialCorrupt`] for an
-    /// unusable stored node, or [`MirrorError::Store`].
-    pub fn log_root(&self, tree_size: u64) -> MirrorResult<Hash> {
-        self.with_conn(|conn| log_root_raw(conn, tree_size))
-    }
-
     /// An RFC 9162 consistency proof between tree sizes `from_size` and `to_size`, opened
     /// through the stored tree material in `O(log to_size)` node reads and no entry bytes.
     ///
@@ -482,7 +475,7 @@ impl Store {
     /// prefix, [`MirrorError::Atl`] if `from_size > to_size`,
     /// [`MirrorError::TreeMaterialMissing`]/[`MirrorError::TreeMaterialCorrupt`] for an
     /// unusable stored node, or [`MirrorError::Store`].
-    pub fn consistency_proof(
+    pub(crate) fn consistency_proof(
         &self,
         from_size: u64,
         to_size: u64,
@@ -496,7 +489,7 @@ impl Store {
     /// # Errors
     ///
     /// As [`Store::consistency_proof`].
-    pub fn consistency_proof_measured(
+    pub(crate) fn consistency_proof_measured(
         &self,
         from_size: u64,
         to_size: u64,
@@ -864,52 +857,81 @@ pub(crate) fn leaf_hashes_range_raw(
     Ok(hashes)
 }
 
-/// What opening one proof or root cost to read out of the store.
+/// What opening one proof or root cost to read out of the store: 32 octets per node.
 ///
 /// Reported rather than asserted, for the same reason [`crate::range::RangeReadCost`] is: the
 /// point of the stored tree material is that a proof about a log does not read the log, and a
 /// number a caller can print is the only form of that claim which cannot quietly stop being
-/// true.
+/// true. Only nodes actually obtained are counted, so a build that fell back to recomputing a
+/// subtree from leaf hashes would show up as a higher count, not a hidden one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TreeReadCost {
+pub(crate) struct TreeReadCost {
     /// Stored 32-octet log-tree nodes read: leaf hashes and complete-subtree roots alike.
-    pub tree_nodes: u64,
+    pub(crate) tree_nodes: u64,
 }
 
-impl TreeReadCost {
-    /// Octets read from the store: 32 per node.
-    #[must_use]
-    pub const fn total_bytes(&self) -> u64 {
-        self.tree_nodes.saturating_mul(32)
-    }
+/// Whether the node at `(level, index)` is COMPLETE under a tree of `bound` leaves: its whole
+/// leaf span `[index * 2^level, (index + 1) * 2^level)` lies inside `[0, bound)`.
+///
+/// A complete node is one the store MUST hold — level 0 in `entries.leaf_hash`, higher levels
+/// in `subtree_roots` — because promotion writes each one the moment its range completes. An
+/// INCOMPLETE node (a right-spine remainder) is legitimately absent and is meant to be folded
+/// from the nodes below it. Anything the arithmetic cannot represent is reported as not
+/// complete, which is the conservative answer: it can only ever permit a descent, never
+/// demand a row.
+const fn node_is_complete(level: u32, index: u64, bound: u64) -> bool {
+    let Some(width) = 1_u64.checked_shl(level) else { return false };
+    let Some(next) = index.checked_add(1) else { return false };
+    let Some(end) = next.checked_mul(width) else { return false };
+    end <= bound
 }
 
-/// Run `f` over a reader of the stored tree material, counting the nodes it reads.
+/// Run `f` over a reader of the stored tree material for a tree of `bound` leaves, counting
+/// the nodes it reads.
 ///
 /// `atl_core`'s proof and root builders take a `(level, index) -> Option<Hash>` callback and
 /// treat `None` as "not stored, descend instead", which leaves no channel for a storage
-/// failure. So a failure is captured here and re-raised after the call, rather than being
-/// silently reported to the builder as an absent node and answered by a descent that reads
-/// bytes it should not have had to.
+/// failure — and makes silent recomputation the default answer to a cache gap. Both are
+/// refused here:
+///
+/// - a read failure is captured and re-raised after the call;
+/// - an absent node that is COMPLETE under `bound` (see [`node_is_complete`]) raises
+///   [`MirrorError::TreeMaterialMissing`] instead of being answered by a descent. Tolerating
+///   it would mean rebuilding that subtree from leaf hashes at serving time: an `O(n)` read
+///   where the caller was promised `O(log n)`, done on material this deployment can no longer
+///   vouch for. The remedy is `rebuild_subtree_cache`, which runs on open (see [`migrate`]),
+///   never mid-request.
+///
+/// `bound` is the size of the tree the proof or root is being built over, so a node complete
+/// under it is complete under the log itself (`bound` never exceeds the stored entry count at
+/// any call site) — a missing row is a storage integrity fault either way.
 fn with_tree_nodes<T>(
     conn: &Connection,
+    bound: u64,
     f: impl FnOnce(&dyn Fn(u32, u64) -> Option<Hash>) -> Result<T, atl_core::AtlError>,
 ) -> MirrorResult<(T, TreeReadCost)> {
     let failure: RefCell<Option<MirrorError>> = RefCell::new(None);
     let reads = Cell::new(0_u64);
+    let record = |err: MirrorError| {
+        let mut slot = failure.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+    };
     let get_node = |level: u32, index: u64| -> Option<Hash> {
         match tree_node_raw(conn, level, index) {
-            Ok(node) => {
-                if node.is_some() {
-                    reads.set(reads.get().saturating_add(1));
+            Ok(Some(node)) => {
+                reads.set(reads.get().saturating_add(1));
+                Some(node)
+            }
+            Ok(None) => {
+                if node_is_complete(level, index, bound) {
+                    record(MirrorError::TreeMaterialMissing { level, node_index: index });
                 }
-                node
+                None
             }
             Err(err) => {
-                let mut slot = failure.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(err);
-                }
+                record(err);
                 None
             }
         }
@@ -932,8 +954,10 @@ pub(crate) fn inclusion_proof_raw(
     leaf_index: u64,
     tree_size: u64,
 ) -> MirrorResult<InclusionProof> {
-    with_tree_nodes(conn, |get_node| generate_inclusion_proof(leaf_index, tree_size, get_node))
-        .map(|(proof, _)| proof)
+    with_tree_nodes(conn, tree_size, |get_node| {
+        generate_inclusion_proof(leaf_index, tree_size, get_node)
+    })
+    .map(|(proof, _)| proof)
 }
 
 /// The RFC 6962 root of the subtree spanning leaves `[offset, offset + size)`, opened through
@@ -943,7 +967,10 @@ pub(crate) fn inclusion_proof_raw(
 /// subtree straight from `subtree_roots` where one is stored, and descends only where it is
 /// not — which, for a store whose cache is current, is the right spine alone.
 pub(crate) fn subtree_root_raw(conn: &Connection, offset: u64, size: u64) -> MirrorResult<Hash> {
-    with_tree_nodes(conn, |get_node| compute_subtree_root(offset, size, &get_node))
+    // Every node this walk asks for lies inside `[offset, offset + size)`, so the span's end
+    // is the bound that decides which of them the store MUST hold.
+    let bound = offset.saturating_add(size);
+    with_tree_nodes(conn, bound, |get_node| compute_subtree_root(offset, size, &get_node))
         .map(|(root, _)| root)
 }
 
@@ -958,6 +985,38 @@ pub(crate) fn log_root_raw(conn: &Connection, tree_size: u64) -> MirrorResult<Ha
         return Ok(compute_root(&[]));
     }
     subtree_root_raw(conn, 0, tree_size)
+}
+
+/// Confirm the complete-subtree cache actually covers `[0, tree_size)`, or name the first
+/// node it is missing.
+///
+/// Checks the root of every maximal complete subtree of `[0, tree_size)` — the RFC 6962
+/// decomposition, one node per set bit of `tree_size`, so `O(log tree_size)` primary-key
+/// lookups. Blocks of one leaf are `entries.leaf_hash` rows, which the caller's entry count
+/// already covers. A gap DEEPER than a block root is not looked for here and does not need to
+/// be: [`with_tree_nodes`] refuses any absent complete node the moment a proof asks for it,
+/// so the two together leave no path that quietly recomputes.
+///
+/// This is a check, never a repair: the repair is [`rebuild_subtree_cache`], which runs on
+/// open.
+pub(crate) fn require_subtree_cache_raw(conn: &Connection, tree_size: u64) -> MirrorResult<()> {
+    let mut offset: u64 = 0;
+    for level in (1..=MAX_SUBTREE_LEVEL).rev() {
+        let Some(width) = 1_u64.checked_shl(level) else { continue };
+        if tree_size.checked_div(width).unwrap_or(0) % 2 == 0 {
+            continue; // no block of this size in `tree_size`'s decomposition
+        }
+        let node_index = offset
+            .checked_div(width)
+            .ok_or(MirrorError::IndexOverflow { what: "subtree cache block index" })?;
+        if tree_node_raw(conn, level, node_index)?.is_none() {
+            return Err(MirrorError::TreeMaterialMissing { level, node_index });
+        }
+        offset = offset
+            .checked_add(width)
+            .ok_or(MirrorError::IndexOverflow { what: "subtree cache block offset" })?;
+    }
+    Ok(())
 }
 
 /// An RFC 9162 consistency proof between tree sizes `from_size` and `to_size`, opened through
@@ -979,7 +1038,9 @@ pub(crate) fn consistency_proof_measured_raw(
     if have != to_size {
         return Err(MirrorError::IncompleteEntries { have, need: to_size });
     }
-    with_tree_nodes(conn, |get_node| generate_consistency_proof(from_size, to_size, get_node))
+    with_tree_nodes(conn, to_size, |get_node| {
+        generate_consistency_proof(from_size, to_size, get_node)
+    })
 }
 
 /// The entry-bytes prover this module replaced, kept as a TEST ORACLE.
@@ -1069,8 +1130,16 @@ fn backfill_leaf_hashes(conn: &Connection) -> MirrorResult<()> {
 /// The expected population is arithmetic, not a guess: a log of `n` entries completes
 /// `n / 2^level` nodes at each level, so comparing the total against the stored row count
 /// detects both a cache that predates this schema and one left short by an interrupted run.
-/// A mismatch rebuilds the whole table, which is cheap relative to the entry bytes already
-/// read to reach it and removes any question of a partially-correct cache.
+/// [`require_subtree_cache_raw`] is asked as well, so a table of the right SIZE but the wrong
+/// SHAPE is caught here rather than at serving time. Either way the whole table is rebuilt,
+/// which is cheap relative to the entry bytes already read to reach it and removes any
+/// question of a partially-correct cache.
+///
+/// This is the ONLY path that rebuilds. It runs on open (see [`migrate`]); a serving path
+/// that meets a missing node refuses with [`MirrorError::TreeMaterialMissing`] and leaves the
+/// repair to an operator reopening the store, because silently rebuilding mid-request would
+/// turn an `O(log n)` promise into an `O(n)` read over material the deployment has just
+/// discovered it cannot vouch for.
 fn rebuild_subtree_cache_if_incomplete(conn: &Connection) -> MirrorResult<()> {
     let overflow = || MirrorError::IndexOverflow { what: "subtree cache population" };
     let entries: i64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))?;
@@ -1085,10 +1154,21 @@ fn rebuild_subtree_cache_if_incomplete(conn: &Connection) -> MirrorResult<()> {
         width = next;
     }
     let stored: i64 = conn.query_row("SELECT COUNT(*) FROM subtree_roots", [], |row| row.get(0))?;
-    if to_u64("subtree row count", stored)? == expected {
+    if to_u64("subtree row count", stored)? == expected
+        && require_subtree_cache_raw(conn, entries).is_ok()
+    {
         return Ok(());
     }
 
+    rebuild_subtree_cache(conn, entries)
+}
+
+/// Rebuild `subtree_roots` for a log of `entries` leaves, from the stored leaf hashes alone.
+///
+/// Folds level by level: `O(n)` reads and writes, once, at open — the maintenance path the
+/// serving paths refuse to perform for themselves.
+fn rebuild_subtree_cache(conn: &Connection, entries: u64) -> MirrorResult<()> {
+    let overflow = || MirrorError::IndexOverflow { what: "subtree cache population" };
     conn.execute("DELETE FROM subtree_roots", [])?;
     let mut current = leaf_hashes_range_raw(conn, 0, entries)?;
     let mut level: u32 = 1;
@@ -1347,7 +1427,9 @@ mod tests {
             for n in 1..=size {
                 let end = usize::try_from(n).expect("small test size");
                 assert_eq!(
-                    store.log_root(n).expect("the store holds this prefix"),
+                    store
+                        .with_conn(|conn| log_root_raw(conn, n))
+                        .expect("the store holds this prefix"),
                     compute_root(&leaves[..end]),
                     "tree_size {size}, root over [0, {n})"
                 );
@@ -1365,7 +1447,10 @@ mod tests {
     #[test]
     fn the_empty_tree_root_is_the_hash_of_no_bytes_and_reads_nothing() {
         let (store, _) = store_with(0);
-        assert_eq!(store.log_root(0).expect("the empty tree"), compute_root(&[]));
+        assert_eq!(
+            store.with_conn(|conn| log_root_raw(conn, 0)).expect("the empty tree"),
+            compute_root(&[])
+        );
     }
 
     #[test]
@@ -1397,21 +1482,105 @@ mod tests {
         );
 
         // What the entry-bytes build read for the same proof: every envelope in [0, 10 000).
+        // Exactly the nodes the RFC 9162 walk names, and no more: a build that answered a
+        // cache gap by recomputing a subtree from leaf hashes would read far more than this,
+        // so the equality is what keeps the logarithmic claim honest rather than aspirational.
+        assert_eq!(cost.tree_nodes, 15, "15 stored nodes against log2(10 000) = 13.3");
+        let after = cost.tree_nodes.saturating_mul(32);
         let before: u64 = entries.iter().map(|b| b.len() as u64).sum();
         assert!(
-            cost.total_bytes().saturating_mul(500) < before,
-            "cached prover read {} bytes; the entry-bytes build read {before}",
-            cost.total_bytes()
+            after.saturating_mul(500) < before,
+            "cached prover read {after} bytes; the entry-bytes build read {before}"
         );
 
         // Recorded so the report quotes numbers this test produced rather than an estimate.
         println!(
             "consistency read cost, sizes 5000 -> {LOG} over a {LOG}-entry log: \
              before {before} bytes (entry bytes for the whole prefix), \
-             after {} bytes ({} stored tree nodes x 32)",
-            cost.total_bytes(),
+             after {after} bytes ({} stored tree nodes x 32)",
             cost.tree_nodes
         );
+    }
+
+    /// A cache row absent behind the store's back is REFUSED, by name, rather than answered
+    /// by recomputing that subtree from leaf hashes — and reopening the store, which runs the
+    /// rebuild, restores service.
+    ///
+    /// Both halves of the guard are exercised, because they cover different gaps: the block
+    /// root of `[0, 8)` is what `require_subtree_cache_raw` checks up front (`O(log n)`
+    /// lookups), while `(level 2, node 1)` sits below it and is caught by the node reader the
+    /// moment a proof asks for it.
+    #[test]
+    fn a_missing_cache_node_is_refused_not_recomputed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gapped-cache.sqlite3");
+        let entries: Vec<Vec<u8>> = (0..9u64).map(entry_bytes).collect();
+
+        let intact = {
+            let store = Store::open(&path).expect("open");
+            for (index, bytes) in entries.iter().enumerate() {
+                let id = ahl_core::sha256_hex(bytes);
+                store.stage_entry(&id, bytes).expect("stage");
+                store
+                    .promote_entry(u64::try_from(index).expect("small test index"), &id)
+                    .expect("promote");
+            }
+            store.consistency_proof(2, 9).expect("the cache is intact")
+        };
+
+        // A node below the block root: the up-front check cannot see it, the reader must.
+        {
+            let store = Store::open(&path).expect("reopen");
+            store
+                .with_conn(|conn| {
+                    conn.execute("DELETE FROM subtree_roots WHERE level = 2 AND node_index = 1", [])
+                        .map(|_| ())
+                        .map_err(MirrorError::from)
+                })
+                .expect("drop one cached node behind the store's back");
+            assert!(matches!(
+                store.consistency_proof(2, 9),
+                Err(MirrorError::TreeMaterialMissing { level: 2, node_index: 1 })
+            ));
+            assert!(matches!(
+                store.subtree_root(4, 4),
+                Err(MirrorError::TreeMaterialMissing { level: 2, node_index: 1 })
+            ));
+            // The block-root check passes: this gap is precisely the one only the reader sees.
+            store
+                .with_conn(|conn| require_subtree_cache_raw(conn, 9))
+                .expect("the block roots are still there");
+        }
+        {
+            let store = Store::open(&path).expect("reopen rebuilds the cache");
+            assert_eq!(store.consistency_proof(2, 9).expect("service restored"), intact);
+        }
+
+        // The block root of [0, 8) itself.
+        {
+            let store = Store::open(&path).expect("reopen");
+            store
+                .with_conn(|conn| {
+                    conn.execute("DELETE FROM subtree_roots WHERE level = 3", [])
+                        .map(|_| ())
+                        .map_err(MirrorError::from)
+                })
+                .expect("drop the block root behind the store's back");
+            assert!(matches!(
+                store.with_conn(|conn| require_subtree_cache_raw(conn, 9)),
+                Err(MirrorError::TreeMaterialMissing { level: 3, node_index: 0 })
+            ));
+            // The root open every serving path starts from (the ingest root check, the range
+            // builder's first step) refuses instead of folding [0, 8) back up from leaves.
+            assert!(matches!(
+                store.with_conn(|conn| log_root_raw(conn, 9)),
+                Err(MirrorError::TreeMaterialMissing { level: 3, node_index: 0 })
+            ));
+        }
+        {
+            let store = Store::open(&path).expect("reopen rebuilds the cache");
+            assert_eq!(store.consistency_proof(2, 9).expect("service restored"), intact);
+        }
     }
 
     #[test]

@@ -122,6 +122,18 @@ pub enum MirrorError {
         tree_size: u64,
     },
 
+    /// A consistency proof was requested from a larger tree to a smaller one.
+    ///
+    /// RFC 9162 §2.1.4 defines the proof for `from ≤ to` only; the trivial `from == to`
+    /// proof (an empty path) is served, the reverse order is the client's error.
+    #[error("consistency proof from tree_size {from} to tree_size {to} is not from ≤ to")]
+    ConsistencyOrder {
+        /// Requested first tree size.
+        from: u64,
+        /// Requested second tree size.
+        to: u64,
+    },
+
     /// No checkpoint with this `tree_size` is authenticated at all.
     #[error("no authenticated checkpoint with tree_size {tree_size}")]
     UnknownCheckpoint {

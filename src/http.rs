@@ -563,6 +563,12 @@ async fn consistency_handler(
     State(state): State<AppState>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    // Order is the client's to get right and is checked before any store access: the prover
+    // reports `from > to` as an `Atl` error, which is a 500 — a claim this mirror failed,
+    // where in fact the request was malformed.
+    if query.from > query.to {
+        return Err(MirrorError::ConsistencyOrder { from: query.from, to: query.to }.into());
+    }
     let store = Arc::clone(&state.store);
     let config = Arc::clone(&state.config);
     let (from_cp, to_cp) = blocking({
@@ -1485,6 +1491,37 @@ mod tests {
             value["error"],
             "log tree material at level 2, node 0 is missing from the store"
         );
+    }
+
+    /// `from > to` is the client's error (400), never a prover failure (500); `from == to`
+    /// is RFC 9162's trivial proof and is served with an empty path.
+    #[tokio::test]
+    async fn a_reversed_consistency_request_is_the_clients_error() {
+        let hx = harness();
+        let (app, _) = app_with_two_series_members(&hx).await;
+
+        let request = Request::get("/v1/consistency?from=10&to=5")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = app.clone().oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            value["error"],
+            "consistency proof from tree_size 10 to tree_size 5 is not from ≤ to"
+        );
+
+        let request = Request::get("/v1/consistency?from=10&to=10")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = app.oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["from"], 10);
+        assert_eq!(value["to"], 10);
+        assert_eq!(value["consistency_path"], json!([]));
     }
 
     /// The fuzz seam runs the same parsers the handlers above run, so it is exercised the

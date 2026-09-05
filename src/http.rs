@@ -563,6 +563,12 @@ async fn consistency_handler(
     State(state): State<AppState>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    // Order is the client's to get right and is checked before any store access: the prover
+    // reports `from > to` as an `Atl` error, which is a 500 — a claim this mirror failed,
+    // where in fact the request was malformed.
+    if query.from > query.to {
+        return Err(MirrorError::ConsistencyOrder { from: query.from, to: query.to }.into());
+    }
     let store = Arc::clone(&state.store);
     let config = Arc::clone(&state.config);
     let (from_cp, to_cp) = blocking({
@@ -575,26 +581,12 @@ async fn consistency_handler(
     })
     .await?;
 
+    // The proof comes out of the store's cached tree material: `O(log to_size)` stored
+    // 32-octet nodes, no entry bytes at all. The path is the same RFC 9162 path a build over
+    // the whole leaf sequence produces — `store::tests::the_cached_prover_agrees_with_an_entry_bytes_build`
+    // holds the two together node for node.
     let path = blocking(move || {
-        let entries = store.get_entries_range(0, to_cp.tree_size)?;
-        let have = u64::try_from(entries.len())
-            .map_err(|_| MirrorError::IndexOverflow { what: "entries.len()" })?;
-        if have != to_cp.tree_size {
-            return Err(MirrorError::IncompleteEntries { have, need: to_cp.tree_size });
-        }
-        let leaf_hashes: Vec<_> =
-            entries.iter().map(|bytes| crate::metadata::log_leaf_hash(bytes)).collect();
-        let proof = atl_core::core::merkle::generate_consistency_proof(
-            from_cp.tree_size,
-            to_cp.tree_size,
-            |level, i| {
-                if level == 0 {
-                    leaf_hashes.get(usize::try_from(i).ok()?).copied()
-                } else {
-                    None
-                }
-            },
-        )?;
+        let proof = store.consistency_proof(from_cp.tree_size, to_cp.tree_size)?;
         Ok::<_, MirrorError>(
             proof.path.iter().map(|h| format!("sha256:{}", hex::encode(h))).collect::<Vec<_>>(),
         )
@@ -1394,6 +1386,142 @@ mod tests {
             Request::get("/v1/consistency?from=0&to=5").body(Body::empty()).expect("valid request");
         let response = app.oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// An app whose store holds the genesis manifest plus nine entries, with series-usable
+    /// checkpoints at tree sizes 5 and 10 — three minutes apart, inside the harness's
+    /// five-minute cadence. Returns the app and the nine entries, in index order.
+    async fn app_with_two_series_members(hx: &TestHarness) -> (Router, Vec<Vec<u8>>) {
+        let app = router(hx.state.clone());
+
+        let first: Vec<Vec<u8>> = (0u8..4).map(envelope_bytes).collect();
+        for bytes in &first {
+            assert_eq!(stage(&app, bytes).await, StatusCode::CREATED);
+        }
+        let (cp1, pending1) =
+            signed_checkpoint_for(hx, &first, "2026-01-01T00:00:00.000000000Z", true);
+        assert_eq!(submit_checkpoint(&app, &cp1, &pending1).await, StatusCode::CREATED);
+
+        let more: Vec<Vec<u8>> = (4u8..9).map(envelope_bytes).collect();
+        for bytes in &more {
+            assert_eq!(stage(&app, bytes).await, StatusCode::CREATED);
+        }
+        let all_new: Vec<Vec<u8>> = first.iter().chain(more.iter()).cloned().collect();
+        let (cp2, pending2) =
+            signed_checkpoint_for(hx, &all_new, "2026-01-01T00:03:00.000000000Z", true);
+        assert_eq!(submit_checkpoint(&app, &cp2, &pending2).await, StatusCode::CREATED);
+
+        (app, all_new)
+    }
+
+    /// The served `consistency_path` is byte for byte the path an entry-bytes build produces
+    /// — the route now opens the proof through the store's cached tree material, and the
+    /// response is unchanged by that.
+    #[tokio::test]
+    async fn the_served_consistency_path_is_the_entry_bytes_path() {
+        let hx = harness(); // cadence: 5 minutes
+        let (app, all_new) = app_with_two_series_members(&hx).await;
+
+        // tree sizes 5 and 10: the genesis manifest, then four entries, then five more.
+        let request = Request::get("/v1/consistency?from=5&to=10")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = app.oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+
+        // The oracle: the same RFC 9162 proof generated from leaf hashes re-derived from the
+        // entry bytes, which is what this route did before.
+        let mut leaves = vec![hx.genesis_leaf];
+        leaves.extend(all_new.iter().map(|b| log_leaf_hash(b)));
+        let oracle = atl_core::core::merkle::generate_consistency_proof(5, 10, |level, at| {
+            if level == 0 {
+                leaves.get(usize::try_from(at).ok()?).copied()
+            } else {
+                None
+            }
+        })
+        .expect("well-formed sizes");
+        let expected: Vec<Value> = oracle
+            .path
+            .iter()
+            .map(|h| Value::String(format!("sha256:{}", hex::encode(h))))
+            .collect();
+        assert!(!expected.is_empty(), "a 5 -> 10 proof is not the trivial empty path");
+        assert_eq!(value["consistency_path"].as_array().expect("array"), &expected);
+    }
+
+    /// A cache row missing behind the store's back takes the consistency route out of
+    /// service — a storage integrity fault, reported as one — rather than being answered by
+    /// a proof rebuilt from entry-derived leaf hashes.
+    #[tokio::test]
+    async fn a_consistency_request_over_a_gapped_cache_is_refused_by_name() {
+        let hx = harness();
+        let (app, _) = app_with_two_series_members(&hx).await;
+        hx.state
+            .store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM subtree_roots WHERE level = 2 AND node_index = 0", [])
+                    .map(|_| ())
+                    .map_err(MirrorError::from)
+            })
+            .expect("drop one cached node behind the store's back");
+
+        let request = Request::get("/v1/consistency?from=5&to=10")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = app.clone().oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            value["error"],
+            "log tree material at level 2, node 0 is missing from the store"
+        );
+
+        // ITUB goes with it, and as the same fault: an unavailable ITUB (404) would claim
+        // this mirror had looked and found no bound, which is not what happened.
+        let request = Request::get("/v1/itub/0").body(Body::empty()).expect("valid request");
+        let response = app.oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            value["error"],
+            "log tree material at level 2, node 0 is missing from the store"
+        );
+    }
+
+    /// `from > to` is the client's error (400), never a prover failure (500); `from == to`
+    /// is RFC 9162's trivial proof and is served with an empty path.
+    #[tokio::test]
+    async fn a_reversed_consistency_request_is_the_clients_error() {
+        let hx = harness();
+        let (app, _) = app_with_two_series_members(&hx).await;
+
+        let request = Request::get("/v1/consistency?from=10&to=5")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = app.clone().oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            value["error"],
+            "consistency proof from tree_size 10 to tree_size 5 is not from ≤ to"
+        );
+
+        let request = Request::get("/v1/consistency?from=10&to=10")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = app.oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["from"], 10);
+        assert_eq!(value["to"], 10);
+        assert_eq!(value["consistency_path"], json!([]));
     }
 
     /// The fuzz seam runs the same parsers the handlers above run, so it is exercised the

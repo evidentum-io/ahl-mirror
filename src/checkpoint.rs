@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use atl_core::core::merkle::{compute_root, generate_consistency_proof, verify_consistency, Hash};
+use atl_core::core::merkle::{generate_consistency_proof, verify_consistency, Hash};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use time::macros::format_description;
@@ -312,11 +312,21 @@ pub fn verify_checkpoint_signature(
     Ok(())
 }
 
-/// Verify that `to_cp` is consistent with `from_cp`.
+/// Verify that `to_cp` is consistent with `from_cp`, from a caller-supplied leaf sequence.
 ///
 /// That is: `from_cp` is exactly the size-`from_cp.tree_size` prefix of the tree `to_cp`
 /// commits, given the leaf hashes covering `[0, to_cp.tree_size)` (core spec §7.3; adaptor
 /// profile §5.2.2 item 1). `from_cp.tree_size` MUST be less than `to_cp.tree_size`.
+///
+/// This is the **offline** form, for a caller that already holds the whole leaf sequence. It
+/// is not what this mirror uses on its own material: [`series_view`] and
+/// `GET /v1/consistency` open the same RFC 9162 proof through the store's cached tree
+/// material instead (see [`crate::store`]), which reads `O(log to_size)` stored nodes rather
+/// than every leaf of the prefix. The two reach the same verdict from the same proof:
+/// `store::tests::the_cached_prover_agrees_with_an_entry_bytes_build` holds the two proofs
+/// together node for node, and `tests::the_stored_series_checks_agree_with_the_leaf_sequence_forms`
+/// holds this function against its store-backed form — both over every `(m, n)` pair for
+/// every tree shape up to 33 entries.
 ///
 /// # Errors
 ///
@@ -339,30 +349,85 @@ pub fn verify_series_consistency(
     Ok(verify_consistency(&proof, &from_root, &to_root)?)
 }
 
-/// Fetch the complete, contiguous log-leaf-hash sequence for `[0, tree_size)` from an
-/// already-open connection, or report how far short the store is.
+/// Whether this mirror holds the whole contiguous prefix `[0, tree_size)`, with the derived
+/// tree material to open it.
 ///
-/// The `&Connection` core of [`leaf_hashes_for`] — usable inside a transaction (see
-/// [`ingest_checkpoint`]), where calling [`leaf_hashes_for`] itself would deadlock by
-/// re-locking the store's mutex.
+/// Two questions, and they fail differently on purpose:
 ///
-/// Reads the leaf hashes the store recorded at promotion (adaptor profile §4.2) rather than
-/// re-deriving them from entry bytes: the two are the same function of the same bytes, and the
-/// stored form is 32 octets per entry instead of a whole envelope.
-fn leaf_hashes_for_conn(conn: &rusqlite::Connection, tree_size: u64) -> MirrorResult<Vec<Hash>> {
-    let hashes = crate::store::leaf_hashes_range_raw(conn, 0, tree_size)?;
-    let have = u64::try_from(hashes.len())
-        .map_err(|_| MirrorError::IndexOverflow { what: "entries.len()" })?;
-    if have != tree_size {
-        return Err(MirrorError::IncompleteEntries { have, need: tree_size });
+/// - Does canonical storage reach `tree_size`? A `SELECT COUNT(*)` over an append-only,
+///   gap-free table (promotion refuses any index but the next one — see [`crate::store`]),
+///   so it answers without reading a leaf hash, let alone an entry. `Ok(false)` if not: a
+///   short prefix is an ordinary state of a mirror that is behind, and core spec §7.3 admits
+///   a checkpoint as merely *authenticated* there.
+/// - Given that it does, is the complete-subtree cache present for that size? An absence is
+///   not a short prefix but a storage integrity fault — the rows are derived from entries
+///   this store already holds — so it is an ERROR
+///   ([`MirrorError::TreeMaterialMissing`], naming the node), never a quiet `false` and never
+///   a recomputation from leaf hashes at serving time. The remedy is the cache rebuild the
+///   store runs on open.
+fn holds_prefix(conn: &rusqlite::Connection, tree_size: u64) -> MirrorResult<bool> {
+    if crate::store::count_entries_raw(conn, 0, tree_size)? != tree_size {
+        return Ok(false);
     }
-    Ok(hashes)
+    crate::store::require_subtree_cache_raw(conn, tree_size)?;
+    Ok(true)
 }
 
-/// Fetch the complete, contiguous log-leaf-hash sequence for `[0, tree_size)`, or report how
-/// far short the store is.
-fn leaf_hashes_for(store: &Store, tree_size: u64) -> MirrorResult<Vec<Hash>> {
-    store.with_conn(|conn| leaf_hashes_for_conn(conn, tree_size))
+/// Whether `cp.root_hash` is the root of the prefix this mirror holds at `cp.tree_size`.
+///
+/// The root is opened through the store's cached tree material — `O(log tree_size)` stored
+/// nodes — never re-derived by hashing entry envelopes. Callers MUST establish
+/// [`holds_prefix`] first: a root over a prefix the store does not reach is a claim about a
+/// tree it cannot see.
+fn root_matches_stored(conn: &rusqlite::Connection, cp: &Checkpoint) -> MirrorResult<bool> {
+    let claimed: Hash = ahl_core::parse_hash_hex(&cp.root_hash)?;
+    Ok(crate::store::log_root_raw(conn, cp.tree_size)? == claimed)
+}
+
+/// [`verify_series_consistency`] over the store's cached tree material: the same RFC 9162
+/// proof, opened in `O(log to_cp.tree_size)` stored-node reads instead of from the full leaf
+/// sequence.
+fn series_consistency_stored(
+    conn: &rusqlite::Connection,
+    from_cp: &Checkpoint,
+    to_cp: &Checkpoint,
+) -> MirrorResult<bool> {
+    let from_root: Hash = ahl_core::parse_hash_hex(&from_cp.root_hash)?;
+    let to_root: Hash = ahl_core::parse_hash_hex(&to_cp.root_hash)?;
+    let (proof, _) =
+        crate::store::consistency_proof_measured_raw(conn, from_cp.tree_size, to_cp.tree_size)?;
+    Ok(verify_consistency(&proof, &from_root, &to_root)?)
+}
+
+/// Whether `err` says the STORE is broken, rather than that this checkpoint cannot be
+/// established from a sound one.
+///
+/// The distinction decides who hears about it: a checkpoint this mirror cannot establish is
+/// reported as merely authenticated and the series carries on, while a storage integrity
+/// fault is propagated — [`series_view`] refuses to publish a verdict computed over material
+/// it has just found missing or unreadable.
+const fn is_storage_fault(err: &MirrorError) -> bool {
+    matches!(
+        err,
+        MirrorError::TreeMaterialMissing { .. }
+            | MirrorError::TreeMaterialCorrupt { .. }
+            | MirrorError::Store(_)
+            | MirrorError::StoreInit(_)
+    )
+}
+
+/// Whether `cp` is series-usable given `pred`, the nearest earlier series-usable member:
+/// the store holds its whole prefix, its root recomputes, and it is consistent with `pred`
+/// (vacuously so where there is none). See [`series_view`].
+fn series_usable_stored(
+    conn: &rusqlite::Connection,
+    cp: &Checkpoint,
+    pred: Option<&Checkpoint>,
+) -> MirrorResult<bool> {
+    if !holds_prefix(conn, cp.tree_size)? || !root_matches_stored(conn, cp)? {
+        return Ok(false);
+    }
+    pred.map_or_else(|| Ok(true), |pred| series_consistency_stored(conn, pred, cp))
 }
 
 /// Build the best-effort entry prefix a governance resolution can use: canonical storage,
@@ -662,10 +727,15 @@ pub fn ingest_checkpoint(
             )?;
         }
 
-        if let Ok(leaf_hashes) = leaf_hashes_for_conn(conn, cp.tree_size) {
-            if compute_root(&leaf_hashes) != claimed_root {
-                return Err(MirrorError::CheckpointRootMismatch { tree_size: cp.tree_size });
-            }
+        // Only once this mirror holds the whole prefix the checkpoint commits: below that,
+        // there is no root of this log to compare against, and core spec §7.3 admits the
+        // checkpoint as merely authenticated rather than refusing it. Where the prefix IS
+        // held, the root is opened through the stored tree material (`O(log tree_size)`
+        // nodes), not rebuilt from entry bytes.
+        if holds_prefix(conn, cp.tree_size)?
+            && crate::store::log_root_raw(conn, cp.tree_size)? != claimed_root
+        {
+            return Err(MirrorError::CheckpointRootMismatch { tree_size: cp.tree_size });
         }
 
         if admission.series_member {
@@ -852,11 +922,6 @@ fn compute_gap_free_frontier(
     Ok(GapFreeResult { frontier: Some(frontier), stop: equivocation_stop })
 }
 
-/// Whether the root recomputed from `leaves` matches `cp.root_hash`.
-fn root_matches(leaves: &[Hash], cp: &Checkpoint) -> bool {
-    ahl_core::parse_hash_hex(&cp.root_hash).is_ok_and(|root| compute_root(leaves) == root)
-}
-
 /// Compute the current [`SeriesView`]: every authenticated checkpoint labelled with its state
 /// (core spec §7.3), and the gap-free frontier of the series-usable subset.
 ///
@@ -877,12 +942,19 @@ pub fn series_view(store: &Store, config: &Config) -> MirrorResult<SeriesView> {
     let mut last_usable: Option<Checkpoint> = None;
 
     for cp in &all {
-        let usable = leaf_hashes_for(store, cp.tree_size).is_ok_and(|leaves| {
-            root_matches(&leaves, cp)
-                && last_usable.as_ref().is_none_or(|pred| {
-                    verify_series_consistency(pred, cp, &leaves).unwrap_or(false)
-                })
-        });
+        // One acquisition of the store's lock per member, so the prefix check, the root and
+        // the consistency proof all see one consistent state. A member this mirror cannot
+        // establish — short prefix, a malformed root string — is reported as merely
+        // authenticated, which is what it is: unproven here, not refused. A broken STORE is
+        // the other case entirely and is propagated (see [`is_storage_fault`]): a view
+        // computed over tree material this deployment has just found missing would be a
+        // verdict it cannot stand behind.
+        let usable =
+            match store.with_conn(|conn| series_usable_stored(conn, cp, last_usable.as_ref())) {
+                Ok(usable) => usable,
+                Err(err) if is_storage_fault(&err) => return Err(err),
+                Err(_) => false,
+            };
 
         members.push(ReportedCheckpoint {
             checkpoint: cp.clone(),
@@ -954,6 +1026,7 @@ pub fn itub(view: &SeriesView, index: u64) -> Option<&Checkpoint> {
 
 #[cfg(test)]
 mod tests {
+    use atl_core::core::merkle::compute_root;
     use sha2::Digest as _;
 
     use super::*;
@@ -1126,6 +1199,130 @@ mod tests {
         let mut tampered = to_cp;
         tampered.root_hash = format!("sha256:{}", "00".repeat(32));
         assert!(!verify_series_consistency(&from_cp, &tampered, &leaves).expect("well-formed"));
+    }
+
+    /// A store holding `count` canonical entries, and the entry bytes themselves.
+    fn store_over(count: u64) -> (Store, Vec<Vec<u8>>) {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let mut entries = Vec::new();
+        for index in 0..count {
+            let bytes = ahl_core::jcs(&serde_json::json!({
+                "payload": { "n": index },
+                "signatures": [ { "key_id": "sha256:aa", "sig": "base64:bb" } ],
+            }));
+            let id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)));
+            store.stage_entry(&id, &bytes).expect("stage");
+            store.promote_entry(index, &id).expect("promote");
+            entries.push(bytes);
+        }
+        (store, entries)
+    }
+
+    /// The store-backed series checks and their leaf-sequence forms MUST reach the same
+    /// verdict for every `(m, n)` pair over every tree shape up to 33 entries: the same RFC
+    /// 9162 proof against the same roots, whether the nodes came from the cache or from a
+    /// full leaf sequence re-derived from the entry bytes. `verify_series_consistency` and
+    /// `compute_root` over those leaves are the oracles.
+    #[test]
+    fn the_stored_series_checks_agree_with_the_leaf_sequence_forms() {
+        for size in 1..=33_u64 {
+            let (store, entries) = store_over(size);
+            let leaves: Vec<Hash> =
+                entries.iter().map(|b| crate::metadata::log_leaf_hash(b)).collect();
+            let cp_at = |n: u64| {
+                let end = usize::try_from(n).expect("small test size");
+                root_vehicle(n, compute_root(&leaves[..end]))
+            };
+            for n in 1..=size {
+                let to_cp = cp_at(n);
+                assert!(
+                    store.with_conn(|conn| root_matches_stored(conn, &to_cp)).expect("readable"),
+                    "tree_size {size}, root over [0, {n})"
+                );
+                for m in 1..=n {
+                    let from_cp = cp_at(m);
+                    let stored = store
+                        .with_conn(|conn| series_consistency_stored(conn, &from_cp, &to_cp))
+                        .expect("readable");
+                    assert_eq!(
+                        stored,
+                        verify_series_consistency(&from_cp, &to_cp, &leaves).expect("oracle"),
+                        "tree_size {size}, consistency ({m}, {n})"
+                    );
+                    assert!(stored, "tree_size {size}: ({m}, {n}) is a genuine prefix pair");
+                }
+            }
+        }
+    }
+
+    /// A cache row missing behind the store's back withholds series-usability and refuses
+    /// admission by name, rather than being answered by a recomputation from leaf hashes.
+    /// `ITUB` goes unavailable with it, which is the honest report: this mirror can no longer
+    /// open the root it would be grounding a bound on.
+    #[test]
+    fn a_missing_cache_node_refuses_admission_and_withholds_series_usability() {
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"9c".repeat(32)).expect("seed");
+        let fx = fixture(&log_key, "2026-01-01T00:00:00Z"); // genesis cadence: 5 minutes
+        let genesis_leaf = log_leaf_hash(&fx.store.get_entries_range(0, 1).expect("range")[0]);
+        let second = stored_entry(serde_json::json!({ "n": 1 }), &fx.producer);
+        let root = compute_root(&[genesis_leaf, log_leaf_hash(&second)]);
+        stage_and_promote_at(&fx.store, 2, root, &[second], 1);
+        let cp =
+            checkpoint_for(&log_key, &fx.config.log_id, 2, root, "2026-01-01T00:01:00.000000000Z");
+        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[], None).expect("admits");
+
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert_eq!(view.members[0].state, CheckpointState::SeriesUsable);
+        assert_eq!(itub(&view, 0).map(|cp| cp.tree_size), Some(2));
+
+        fx.store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM subtree_roots WHERE level = 1 AND node_index = 0", [])
+                    .map(|_| ())
+                    .map_err(MirrorError::from)
+            })
+            .expect("drop the cached node behind the store's back");
+
+        // The named error, where a caller can see it.
+        assert!(matches!(
+            fx.store.with_conn(|conn| holds_prefix(conn, 2)),
+            Err(MirrorError::TreeMaterialMissing { level: 1, node_index: 0 })
+        ));
+        assert!(matches!(
+            ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[], None),
+            Err(MirrorError::TreeMaterialMissing { level: 1, node_index: 0 })
+        ));
+
+        // And the series view refuses outright rather than publishing a verdict over
+        // material it cannot open — so `ITUB` is unavailable, by name, not by omission.
+        assert!(matches!(
+            series_view(&fx.store, &fx.config),
+            Err(MirrorError::TreeMaterialMissing { level: 1, node_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn a_stored_series_check_against_a_tampered_root_fails_as_the_oracle_does() {
+        let (store, entries) = store_over(8);
+        let leaves: Vec<Hash> = entries.iter().map(|b| crate::metadata::log_leaf_hash(b)).collect();
+        let from_cp = root_vehicle(4, compute_root(&leaves[..4]));
+        let mut to_cp = root_vehicle(8, compute_root(&leaves));
+        to_cp.root_hash = format!("sha256:{}", "00".repeat(32));
+
+        assert!(!store
+            .with_conn(|conn| series_consistency_stored(conn, &from_cp, &to_cp))
+            .expect("readable"));
+        assert!(!verify_series_consistency(&from_cp, &to_cp, &leaves).expect("oracle"));
+        assert!(!store.with_conn(|conn| root_matches_stored(conn, &to_cp)).expect("readable"));
+    }
+
+    #[test]
+    fn a_checkpoint_over_a_prefix_the_store_does_not_hold_is_not_series_usable() {
+        let (store, entries) = store_over(4);
+        let leaves: Vec<Hash> = entries.iter().map(|b| crate::metadata::log_leaf_hash(b)).collect();
+        let cp = root_vehicle(9, compute_root(&leaves));
+        assert!(!store.with_conn(|conn| holds_prefix(conn, cp.tree_size)).expect("readable"));
+        assert!(!store.with_conn(|conn| series_usable_stored(conn, &cp, None)).expect("readable"));
     }
 
     // ---- fixtures for the full ingest_checkpoint / series_view pipeline ----

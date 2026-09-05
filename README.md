@@ -211,6 +211,33 @@ not needed.
   10 000-entry log: **778 890 bytes read before, 1 772 after** (780 entry bytes plus 31 stored
   32-octet tree nodes), and `build_range_response_measured` reports that figure rather than
   leaving it to be asserted.
+- **Every root and every proof out of the same cache** (core spec §7.3; adaptor profile
+  §5.2.2). The material above is not only for enumeration. The root check at checkpoint
+  ingest, each series member's root and its consistency proof with the nearest earlier
+  series-usable member (what `ITUB` and `GET /v1/checkpoints` rest on), and the
+  `GET /v1/consistency` endpoint all open their roots and paths through the stored leaf
+  hashes and the complete-subtree cache: `O(log n)` stored 32-octet nodes, and not one entry
+  envelope. Measured on a proof between sizes 5 000 and 10 000 over a 10 000-entry log:
+  **778 890 bytes read before, 480 after** (15 stored nodes). The proofs are unchanged —
+  `store::consistency_proof_from_entry_bytes`, the previous entry-bytes build, is retained as
+  a test oracle, and `the_cached_prover_agrees_with_an_entry_bytes_build` holds the two
+  together node for node for every `(m, n)` pair over every tree shape up to 33 entries
+  (`checkpoint::tests::the_stored_series_checks_agree_with_the_leaf_sequence_forms` does the
+  same for the series checks, against the public `verify_series_consistency`). What still
+  reads the entry prefix is governance resolution, which must parse the `manifest` and `key`
+  statements to know which keys govern at all — bytes read to be parsed, never to rebuild a
+  root.
+- **A cache gap is refused, not silently recomputed.** `atl-core`'s node callback reads an
+  absent node as "descend and recompute", which would turn a missing `subtree_roots` row into
+  an `O(n)` fold over leaf hashes — the logarithmic promise quietly broken, on derived material
+  the deployment has just discovered it cannot vouch for. So a node that is *complete* under
+  the tree being opened, and absent, raises `TreeMaterialMissing` naming the node: the
+  consistency endpoint and `ITUB` return 500 rather than an answer, range enumeration and
+  checkpoint admission refuse, and the checkpoint series propagates the fault instead of
+  downgrading its members to "merely authenticated". Admission additionally checks the block
+  roots of the prefix up front (`O(log n)` lookups), so a hole is usually caught before any
+  proof is attempted. The remedy is the cache rebuild the store already runs **on open**, and
+  it stays there: a serving path checks, it never repairs.
 - **Rotation-anchoring checkpoints, held under the outgoing state and served apart**
   (I-D §7.1's transition exception; adaptor profile §16 item 10). Every submitted checkpoint is
   asked two independent questions. The ordinary one: does it verify under the manifest version

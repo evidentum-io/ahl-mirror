@@ -575,26 +575,12 @@ async fn consistency_handler(
     })
     .await?;
 
+    // The proof comes out of the store's cached tree material: `O(log to_size)` stored
+    // 32-octet nodes, no entry bytes at all. The path is the same RFC 9162 path a build over
+    // the whole leaf sequence produces — `store::tests::the_cached_prover_agrees_with_an_entry_bytes_build`
+    // holds the two together node for node.
     let path = blocking(move || {
-        let entries = store.get_entries_range(0, to_cp.tree_size)?;
-        let have = u64::try_from(entries.len())
-            .map_err(|_| MirrorError::IndexOverflow { what: "entries.len()" })?;
-        if have != to_cp.tree_size {
-            return Err(MirrorError::IncompleteEntries { have, need: to_cp.tree_size });
-        }
-        let leaf_hashes: Vec<_> =
-            entries.iter().map(|bytes| crate::metadata::log_leaf_hash(bytes)).collect();
-        let proof = atl_core::core::merkle::generate_consistency_proof(
-            from_cp.tree_size,
-            to_cp.tree_size,
-            |level, i| {
-                if level == 0 {
-                    leaf_hashes.get(usize::try_from(i).ok()?).copied()
-                } else {
-                    None
-                }
-            },
-        )?;
+        let proof = store.consistency_proof(from_cp.tree_size, to_cp.tree_size)?;
         Ok::<_, MirrorError>(
             proof.path.iter().map(|h| format!("sha256:{}", hex::encode(h))).collect::<Vec<_>>(),
         )
@@ -1394,6 +1380,61 @@ mod tests {
             Request::get("/v1/consistency?from=0&to=5").body(Body::empty()).expect("valid request");
         let response = app.oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The served `consistency_path` is byte for byte the path an entry-bytes build produces
+    /// — the route now opens the proof through the store's cached tree material, and the
+    /// response is unchanged by that.
+    #[tokio::test]
+    async fn the_served_consistency_path_is_the_entry_bytes_path() {
+        let hx = harness(); // cadence: 5 minutes
+        let app = router(hx.state.clone());
+
+        let first: Vec<Vec<u8>> = (0u8..4).map(envelope_bytes).collect();
+        for bytes in &first {
+            assert_eq!(stage(&app, bytes).await, StatusCode::CREATED);
+        }
+        let (cp1, pending1) =
+            signed_checkpoint_for(&hx, &first, "2026-01-01T00:00:00.000000000Z", true);
+        assert_eq!(submit_checkpoint(&app, &cp1, &pending1).await, StatusCode::CREATED);
+
+        let more: Vec<Vec<u8>> = (4u8..9).map(envelope_bytes).collect();
+        for bytes in &more {
+            assert_eq!(stage(&app, bytes).await, StatusCode::CREATED);
+        }
+        let all_new: Vec<Vec<u8>> = first.iter().chain(more.iter()).cloned().collect();
+        let (cp2, pending2) =
+            signed_checkpoint_for(&hx, &all_new, "2026-01-01T00:03:00.000000000Z", true);
+        assert_eq!(submit_checkpoint(&app, &cp2, &pending2).await, StatusCode::CREATED);
+
+        // tree sizes 5 and 10: the genesis manifest, then four entries, then five more.
+        let request = Request::get("/v1/consistency?from=5&to=10")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = app.oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+
+        // The oracle: the same RFC 9162 proof generated from leaf hashes re-derived from the
+        // entry bytes, which is what this route did before.
+        let mut leaves = vec![hx.genesis_leaf];
+        leaves.extend(all_new.iter().map(|b| log_leaf_hash(b)));
+        let oracle = atl_core::core::merkle::generate_consistency_proof(5, 10, |level, at| {
+            if level == 0 {
+                leaves.get(usize::try_from(at).ok()?).copied()
+            } else {
+                None
+            }
+        })
+        .expect("well-formed sizes");
+        let expected: Vec<Value> = oracle
+            .path
+            .iter()
+            .map(|h| Value::String(format!("sha256:{}", hex::encode(h))))
+            .collect();
+        assert!(!expected.is_empty(), "a 5 -> 10 proof is not the trivial empty path");
+        assert_eq!(value["consistency_path"].as_array().expect("array"), &expected);
     }
 
     /// The fuzz seam runs the same parsers the handlers above run, so it is exercised the

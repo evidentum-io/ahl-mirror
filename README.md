@@ -227,6 +227,17 @@ not needed.
   reads the entry prefix is governance resolution, which must parse the `manifest` and `key`
   statements to know which keys govern at all — bytes read to be parsed, never to rebuild a
   root.
+- **A cache gap is refused, not silently recomputed.** `atl-core`'s node callback reads an
+  absent node as "descend and recompute", which would turn a missing `subtree_roots` row into
+  an `O(n)` fold over leaf hashes — the logarithmic promise quietly broken, on derived material
+  the deployment has just discovered it cannot vouch for. So a node that is *complete* under
+  the tree being opened, and absent, raises `TreeMaterialMissing` naming the node: the
+  consistency endpoint and `ITUB` return 500 rather than an answer, range enumeration and
+  checkpoint admission refuse, and the checkpoint series propagates the fault instead of
+  downgrading its members to "merely authenticated". Admission additionally checks the block
+  roots of the prefix up front (`O(log n)` lookups), so a hole is usually caught before any
+  proof is attempted. The remedy is the cache rebuild the store already runs **on open**, and
+  it stays there: a serving path checks, it never repairs.
 - **Rotation-anchoring checkpoints, held under the outgoing state and served apart**
   (I-D §7.1's transition exception; adaptor profile §16 item 10). Every submitted checkpoint is
   asked two independent questions. The ordinary one: does it verify under the manifest version

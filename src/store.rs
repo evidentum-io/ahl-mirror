@@ -34,6 +34,35 @@
 //! entry id and the entry index exactly as the brief specifies; `SQLite` is the file format,
 //! not an architectural commitment beyond that.
 //!
+//! # Rotation-anchoring checkpoints are stored apart
+//!
+//! `rotation_checkpoints` is a second, separate checkpoint table, and separateness is the
+//! point. A rotation-anchoring checkpoint verifies under the OUTGOING log key set rather than
+//! the state active for its own `tree_size` (I-D §7.1's transition exception), so it is not a
+//! member of the canonical series and MUST NOT be served as one — not by `GET /v1/checkpoints`,
+//! not as an `ITUB` bound, not as a consistency neighbour. Holding it in the same table as the
+//! series and filtering on read would make every one of those call sites responsible for
+//! remembering the distinction; holding it apart means none of them can forget. What the two
+//! tables DO share is the equivocation scan (see [`crate::checkpoint::series_view`]): a
+//! rotation-anchoring checkpoint that contradicts a series member at the same `tree_size` is a
+//! divergence like any other.
+//!
+//! # Tree material beside the entries
+//!
+//! Two derived columns/tables exist so that an enumeration response costs `O(window + log n)`
+//! reads rather than `O(n)` (adaptor profile §10.3-§10.5). Neither is authority: both are
+//! recomputable from the entry bytes, and the migration below rebuilds either on demand.
+//!
+//! - `entries.leaf_hash` holds each canonical entry's ATL log leaf hash (adaptor profile
+//!   §4.2), written at promotion. Existing rows are backfilled once, on open.
+//! - `subtree_roots` holds the root of every COMPLETE power-of-two subtree of the log tree
+//!   (RFC 6962 geometry), for levels 1 and above; level 0 is `entries.leaf_hash` itself, so
+//!   no hash is stored twice. A node at `(level, node_index)` covers the leaves
+//!   `[node_index * 2^level, (node_index + 1) * 2^level)` and is written the moment that
+//!   range becomes complete — which, because promotion is append-only and gap-free, is the
+//!   promotion of its last leaf. `compute_subtree_root` then opens any span of the tree
+//!   through these two, descending only the right spine.
+//!
 //! Concurrency: the store serializes all access behind one connection and one mutex.
 //! Governance resolution and signature verification (read-only) happen before any write; the
 //! writes themselves — promoting every entry in a checkpoint's `entries_to_promote` batch and
@@ -44,13 +73,18 @@
 //! construction (one producer, one log, per adaptor profile §3), so cross-request
 //! transactions are not needed on top of this.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Mutex;
 
+use atl_core::core::merkle::{
+    compute_subtree_root, generate_inclusion_proof, hash_children, Hash, InclusionProof,
+};
 use rusqlite::{params, Connection, OptionalExtension as _};
 
 use crate::checkpoint::Checkpoint;
 use crate::error::{MirrorError, MirrorResult};
+use crate::metadata::log_leaf_hash;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS staged_entries (
@@ -60,7 +94,8 @@ CREATE TABLE IF NOT EXISTS staged_entries (
 CREATE TABLE IF NOT EXISTS entries (
     entry_index INTEGER PRIMARY KEY,
     entry_id    TEXT NOT NULL UNIQUE,
-    envelope    BLOB NOT NULL
+    envelope    BLOB NOT NULL,
+    leaf_hash   BLOB
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,7 +107,30 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     signature       TEXT NOT NULL,
     UNIQUE(tree_size, checkpoint_time)
 );
+CREATE TABLE IF NOT EXISTS rotation_checkpoints (
+    manifest_entry_index INTEGER NOT NULL,
+    tree_size            INTEGER NOT NULL,
+    log_id               TEXT NOT NULL,
+    root_hash            TEXT NOT NULL,
+    checkpoint_time      TEXT NOT NULL,
+    key_id               TEXT NOT NULL,
+    signature            TEXT NOT NULL,
+    PRIMARY KEY (manifest_entry_index, tree_size, checkpoint_time)
+);
+CREATE TABLE IF NOT EXISTS subtree_roots (
+    level      INTEGER NOT NULL,
+    node_index INTEGER NOT NULL,
+    hash       BLOB NOT NULL,
+    PRIMARY KEY (level, node_index)
+) WITHOUT ROWID;
 ";
+
+/// How many rows the leaf-hash backfill reads at a time (see `backfill_leaf_hashes`).
+const BACKFILL_BATCH: i64 = 1024;
+
+/// The highest subtree level a `u64` tree size can complete: a level-`L` node covers `2^L`
+/// leaves, so `L` never exceeds 63.
+const MAX_SUBTREE_LEVEL: u32 = 63;
 
 /// The outcome of staging or promoting an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +199,7 @@ impl Store {
 
     fn from_connection(conn: Connection) -> MirrorResult<Self> {
         conn.execute_batch(SCHEMA).map_err(|e| MirrorError::StoreInit(e.to_string()))?;
+        migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -291,13 +350,20 @@ impl Store {
     /// not the next expected canonical index), a conflicting occupant at that index, and the
     /// same `entry_id` claimed at a second index.
     ///
+    /// Runs inside a transaction, because promotion is two writes and not one: the canonical
+    /// row and the complete-subtree roots it completes (see the module docs). Committing the
+    /// row and then failing to extend the cache would leave a log whose stored tree material
+    /// disagrees with its entries — the migration would rebuild it on the next open, but until
+    /// then every range and inclusion proof over that span would open the wrong root, so the
+    /// two writes land together or not at all.
+    ///
     /// # Errors
     ///
     /// [`MirrorError::NotStaged`], [`MirrorError::OutOfOrderIndex`],
     /// [`MirrorError::IndexConflict`], [`MirrorError::EntryIdAtDifferentIndex`], or
     /// [`MirrorError::Store`].
     pub fn promote_entry(&self, entry_index: u64, entry_id: &str) -> MirrorResult<InsertOutcome> {
-        self.with_conn(|conn| promote_entry_raw(conn, entry_index, entry_id))
+        self.with_transaction(|conn| promote_entry_raw(conn, entry_index, entry_id))
     }
 
     /// Fetch an entry by its AHL entry id.
@@ -330,6 +396,53 @@ impl Store {
     /// proofs) MUST check the returned count against the expected width.
     pub fn get_entries_range(&self, from_index: u64, to_index: u64) -> MirrorResult<Vec<Vec<u8>>> {
         self.with_conn(|conn| get_entries_range_raw(conn, from_index, to_index))
+    }
+
+    /// How many canonical entries are stored in `[from_index, to_index)`.
+    ///
+    /// Canonical storage is contiguous from index 0 (promotion refuses any other index), so
+    /// this answers "does the store reach `to_index`" without reading a single entry's bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MirrorError::Store`] on a database failure.
+    pub fn count_entries(&self, from_index: u64, to_index: u64) -> MirrorResult<u64> {
+        self.with_conn(|conn| count_entries_raw(conn, from_index, to_index))
+    }
+
+    /// The stored log leaf hashes for `[from_index, to_index)`, in ascending index order
+    /// (adaptor profile §4.2) — 32 bytes per entry instead of the entry itself.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::TreeMaterialMissing`] or [`MirrorError::TreeMaterialCorrupt`] if a
+    /// stored row carries no usable leaf hash, or [`MirrorError::Store`].
+    pub fn leaf_hashes_range(&self, from_index: u64, to_index: u64) -> MirrorResult<Vec<Hash>> {
+        self.with_conn(|conn| leaf_hashes_range_raw(conn, from_index, to_index))
+    }
+
+    /// An RFC 6962 inclusion proof of the leaf at `leaf_index` under a tree of `tree_size`
+    /// (adaptor profile §8.2), opened through the stored tree material.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::Atl`] if the index or size is outside the stored material,
+    /// [`MirrorError::TreeMaterialMissing`]/[`MirrorError::TreeMaterialCorrupt`] for an
+    /// unusable stored node, or [`MirrorError::Store`].
+    pub fn inclusion_proof(&self, leaf_index: u64, tree_size: u64) -> MirrorResult<InclusionProof> {
+        self.with_conn(|conn| inclusion_proof_raw(conn, leaf_index, tree_size))
+    }
+
+    /// The RFC 6962 root of the subtree spanning leaves `[offset, offset + size)`, opened
+    /// through the stored complete-subtree roots (see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::Atl`] if the span is not inside the stored material,
+    /// [`MirrorError::TreeMaterialMissing`]/[`MirrorError::TreeMaterialCorrupt`] for an
+    /// unusable stored node, or [`MirrorError::Store`].
+    pub fn subtree_root(&self, offset: u64, size: u64) -> MirrorResult<Hash> {
+        self.with_conn(|conn| subtree_root_raw(conn, offset, size))
     }
 
     // -----------------------------------------------------------------------------------
@@ -381,6 +494,88 @@ impl Store {
         })
     }
 
+    /// Record a rotation-anchoring checkpoint for the rotation anchored at
+    /// `manifest_entry_index`, apart from the canonical series (see the module docs).
+    ///
+    /// Performs no verification of its own: the caller (see
+    /// [`crate::checkpoint::ingest_checkpoint`]) MUST already have established that the
+    /// checkpoint verifies under the OUTGOING log key set and that the version at
+    /// `manifest_entry_index` is a governance-key rotation. Idempotent for a byte-identical
+    /// resubmission; a different checkpoint at the same `(manifest_entry_index, tree_size,
+    /// checkpoint_time)` is a conflict, on the same append-only footing as the series.
+    /// SEVERAL rotation-anchoring checkpoints for one rotation are legitimate — any checkpoint
+    /// of size greater than the rotating index and signed by the outgoing key is one — so
+    /// distinct sizes and times coexist, and [`Self::get_rotation_checkpoint`] chooses among
+    /// them deterministically.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::SeriesMemberConflict`] or [`MirrorError::Store`].
+    pub fn insert_rotation_checkpoint(
+        &self,
+        manifest_entry_index: u64,
+        cp: &Checkpoint,
+    ) -> MirrorResult<InsertOutcome> {
+        self.with_conn(|conn| insert_rotation_checkpoint_raw(conn, manifest_entry_index, cp))
+    }
+
+    /// The rotation-anchoring checkpoint held for the rotation anchored at
+    /// `manifest_entry_index`, or `None`.
+    ///
+    /// Where several are held, the one with the smallest `(tree_size, checkpoint_time)` is
+    /// returned: it is the earliest attestation of the handover, and it is the cheapest to
+    /// serve, since the inclusion path it grounds runs over the smallest tree. Deterministic
+    /// either way — a route that returned "some member" would let two mirrors holding the same
+    /// material answer differently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MirrorError::Store`] on a database failure.
+    pub fn get_rotation_checkpoint(
+        &self,
+        manifest_entry_index: u64,
+    ) -> MirrorResult<Option<Checkpoint>> {
+        let index_i64 = to_i64("manifest_entry_index", manifest_entry_index)?;
+        self.with_conn(|conn| {
+            row_to_checkpoint(conn.query_row(
+                "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
+                 FROM rotation_checkpoints WHERE manifest_entry_index = ?1 \
+                 ORDER BY tree_size ASC, checkpoint_time ASC LIMIT 1",
+                [index_i64],
+                checkpoint_row,
+            ))
+        })
+    }
+
+    /// Every rotation-anchoring checkpoint held, with the rotation it anchors, ordered
+    /// ascending by `(tree_size, checkpoint_time)`.
+    ///
+    /// The equivocation scan of [`crate::checkpoint::series_view`] reads this: material held
+    /// apart from the series is still material this log published, and a root it contradicts a
+    /// series member with is a divergence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MirrorError::Store`] on a database failure.
+    pub fn all_rotation_checkpoints(&self) -> MirrorResult<Vec<(u64, Checkpoint)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT manifest_entry_index, tree_size, log_id, root_hash, checkpoint_time, \
+                 key_id, signature FROM rotation_checkpoints \
+                 ORDER BY tree_size ASC, checkpoint_time ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let index: i64 = row.get(0)?;
+                Ok((index, checkpoint_row_from(row, 1)?))
+            })?;
+            rows.map(|row| {
+                let (index, cp) = row?;
+                Ok((to_u64("manifest_entry_index", index)?, cp))
+            })
+            .collect()
+        })
+    }
+
     /// Every authenticated checkpoint, ordered ascending by `(tree_size, checkpoint_time)` —
     /// the raw material [`crate::checkpoint::series_view`] computes series-usability and
     /// gap-freeness from. Includes checkpoints that are not (or not yet) series-usable; see
@@ -417,6 +612,10 @@ pub(crate) fn get_staged_raw(conn: &Connection, entry_id: &str) -> MirrorResult<
 }
 
 /// The `&Connection` core of [`Store::promote_entry`].
+///
+/// For callers ALREADY inside a transaction: it performs the canonical insert and the
+/// complete-subtree cache extension as two statements, and only the caller's transaction makes
+/// them one write. [`Store::promote_entry`] supplies that transaction for a standalone caller.
 pub(crate) fn promote_entry_raw(
     conn: &Connection,
     entry_index: u64,
@@ -471,11 +670,305 @@ pub(crate) fn promote_entry_raw(
         return Err(MirrorError::OutOfOrderIndex { expected, got: entry_index });
     }
 
+    let leaf: Hash = log_leaf_hash(&bytes);
     conn.execute(
-        "INSERT INTO entries (entry_index, entry_id, envelope) VALUES (?1, ?2, ?3)",
-        params![index_i64, entry_id, bytes],
+        "INSERT INTO entries (entry_index, entry_id, envelope, leaf_hash) VALUES (?1, ?2, ?3, ?4)",
+        params![index_i64, entry_id, bytes, leaf.as_slice()],
     )?;
+    extend_subtree_cache(conn, entry_index)?;
     Ok(InsertOutcome::Inserted)
+}
+
+// -----------------------------------------------------------------------------------
+// Derived tree material: leaf hashes and complete-subtree roots (see the module docs).
+// -----------------------------------------------------------------------------------
+
+/// One node of the log tree: level 0 from `entries.leaf_hash`, higher levels from
+/// `subtree_roots`.
+///
+/// `None` means the node is not stored, which for level 0 means the entry is not held and for
+/// a higher level means the subtree is not yet complete. Neither is an error here — callers
+/// decide what an absence means.
+pub(crate) fn tree_node_raw(
+    conn: &Connection,
+    level: u32,
+    index: u64,
+) -> MirrorResult<Option<Hash>> {
+    let index_i64 = to_i64("tree node index", index)?;
+    let blob: Option<Vec<u8>> = if level == 0 {
+        conn.query_row("SELECT leaf_hash FROM entries WHERE entry_index = ?1", [index_i64], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .flatten()
+    } else {
+        conn.query_row(
+            "SELECT hash FROM subtree_roots WHERE level = ?1 AND node_index = ?2",
+            params![level, index_i64],
+            |row| row.get(0),
+        )
+        .optional()?
+    };
+    blob.map(|bytes| {
+        Hash::try_from(bytes.as_slice())
+            .map_err(|_| MirrorError::TreeMaterialCorrupt { level, node_index: index })
+    })
+    .transpose()
+}
+
+/// Record the perfect subtrees that the promotion of `entry_index` completed.
+///
+/// Promotion is append-only and gap-free, so promoting index `i` makes the leaf count `i + 1`,
+/// and a level-`L` node completes exactly when that count is a multiple of `2^L`. Its index is
+/// then `count / 2^L - 1` and its children are the two level-`L-1` nodes below it, both of
+/// which completed earlier. The loop therefore climbs one level per trailing zero of `count`:
+/// amortized `O(1)` writes per promotion, `O(log n)` worst case.
+fn extend_subtree_cache(conn: &Connection, entry_index: u64) -> MirrorResult<()> {
+    let overflow = || MirrorError::IndexOverflow { what: "subtree cache index" };
+    let count = entry_index.checked_add(1).ok_or_else(overflow)?;
+    let mut level: u32 = 1;
+    let mut width: u64 = 2;
+    while level <= MAX_SUBTREE_LEVEL && width <= count {
+        if count.checked_rem(width).ok_or_else(overflow)? != 0 {
+            break;
+        }
+        let node_index =
+            count.checked_div(width).ok_or_else(overflow)?.checked_sub(1).ok_or_else(overflow)?;
+        let left_index = node_index.checked_mul(2).ok_or_else(overflow)?;
+        let right_index = left_index.checked_add(1).ok_or_else(overflow)?;
+        let child_level = level.checked_sub(1).ok_or_else(overflow)?;
+        let missing =
+            |index: u64| MirrorError::TreeMaterialMissing { level: child_level, node_index: index };
+        let left =
+            tree_node_raw(conn, child_level, left_index)?.ok_or_else(|| missing(left_index))?;
+        let right =
+            tree_node_raw(conn, child_level, right_index)?.ok_or_else(|| missing(right_index))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO subtree_roots (level, node_index, hash) VALUES (?1, ?2, ?3)",
+            params![
+                level,
+                to_i64("subtree node index", node_index)?,
+                hash_children(&left, &right).as_slice()
+            ],
+        )?;
+        level = level.checked_add(1).ok_or_else(overflow)?;
+        let Some(next_width) = width.checked_mul(2) else { break };
+        width = next_width;
+    }
+    Ok(())
+}
+
+/// The number of canonical entries stored in `[from_index, to_index)`.
+pub(crate) fn count_entries_raw(
+    conn: &Connection,
+    from_index: u64,
+    to_index: u64,
+) -> MirrorResult<u64> {
+    let from_i64 = to_i64("from_index", from_index)?;
+    let to_i64 = to_i64("to_index", to_index)?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entries WHERE entry_index >= ?1 AND entry_index < ?2",
+        params![from_i64, to_i64],
+        |row| row.get(0),
+    )?;
+    to_u64("entry count", count)
+}
+
+/// Every stored log leaf hash in `[from_index, to_index)`, in ascending index order.
+///
+/// Reads 32 bytes per entry rather than the entry bytes themselves. Does **not** itself detect
+/// a gap inside the range; callers needing completeness MUST check the returned count.
+pub(crate) fn leaf_hashes_range_raw(
+    conn: &Connection,
+    from_index: u64,
+    to_index: u64,
+) -> MirrorResult<Vec<Hash>> {
+    let from_i64 = to_i64("from_index", from_index)?;
+    let to_i64 = to_i64("to_index", to_index)?;
+    let mut stmt = conn.prepare(
+        "SELECT entry_index, leaf_hash FROM entries WHERE entry_index >= ?1 AND entry_index < ?2 \
+         ORDER BY entry_index ASC",
+    )?;
+    let rows = stmt.query_map(params![from_i64, to_i64], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+    })?;
+    let mut hashes = Vec::new();
+    for row in rows {
+        let (index, blob) = row?;
+        let index = to_u64("entry_index", index)?;
+        let blob = blob.ok_or(MirrorError::TreeMaterialMissing { level: 0, node_index: index })?;
+        hashes.push(
+            Hash::try_from(blob.as_slice())
+                .map_err(|_| MirrorError::TreeMaterialCorrupt { level: 0, node_index: index })?,
+        );
+    }
+    Ok(hashes)
+}
+
+/// An RFC 6962 inclusion proof of the leaf at `leaf_index` under a tree of `tree_size`,
+/// opened through the stored tree material (adaptor profile §8.2).
+///
+/// Costs `O(log tree_size)` stored nodes for the same reason [`subtree_root_raw`] does: every
+/// sibling on the path is either a complete power-of-two subtree the cache holds or a short
+/// fold over ones it does. A read failure inside the callback is captured and re-raised rather
+/// than being reported as a missing node.
+pub(crate) fn inclusion_proof_raw(
+    conn: &Connection,
+    leaf_index: u64,
+    tree_size: u64,
+) -> MirrorResult<InclusionProof> {
+    let failure: RefCell<Option<MirrorError>> = RefCell::new(None);
+    let get_node = |level: u32, index: u64| -> Option<Hash> {
+        match tree_node_raw(conn, level, index) {
+            Ok(node) => node,
+            Err(err) => {
+                let mut slot = failure.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(err);
+                }
+                None
+            }
+        }
+    };
+    let proof = generate_inclusion_proof(leaf_index, tree_size, get_node);
+    if let Some(err) = failure.borrow_mut().take() {
+        return Err(err);
+    }
+    Ok(proof?)
+}
+
+/// The RFC 6962 root of the subtree spanning leaves `[offset, offset + size)`, opened through
+/// the stored tree material.
+///
+/// `atl_core`'s own recursion does the walking: it takes a complete power-of-two aligned
+/// subtree straight from `subtree_roots` where one is stored, and descends only where it is
+/// not — which, for a store whose cache is current, is the right spine alone. A read failure
+/// inside the callback cannot be returned through it, so it is captured and re-raised here
+/// rather than being reported as a missing node.
+pub(crate) fn subtree_root_raw(conn: &Connection, offset: u64, size: u64) -> MirrorResult<Hash> {
+    let failure: RefCell<Option<MirrorError>> = RefCell::new(None);
+    let get_node = |level: u32, index: u64| -> Option<Hash> {
+        match tree_node_raw(conn, level, index) {
+            Ok(node) => node,
+            Err(err) => {
+                let mut slot = failure.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(err);
+                }
+                None
+            }
+        }
+    };
+    let computed = compute_subtree_root(offset, size, &get_node);
+    if let Some(err) = failure.borrow_mut().take() {
+        return Err(err);
+    }
+    Ok(computed?)
+}
+
+// -----------------------------------------------------------------------------------
+// Migration: bring an existing database up to the derived tree material above.
+// -----------------------------------------------------------------------------------
+
+/// Bring `conn` up to the current schema. Idempotent, and safe to run on an empty database.
+fn migrate(conn: &Connection) -> MirrorResult<()> {
+    add_leaf_hash_column(conn)?;
+    backfill_leaf_hashes(conn)?;
+    rebuild_subtree_cache_if_incomplete(conn)?;
+    Ok(())
+}
+
+/// Add `entries.leaf_hash` to a database created before it existed.
+fn add_leaf_hash_column(conn: &Connection) -> MirrorResult<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(entries)")?;
+    let mut names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let present = names.any(|name| name.is_ok_and(|name| name == "leaf_hash"));
+    drop(names);
+    drop(stmt);
+    if !present {
+        conn.execute("ALTER TABLE entries ADD COLUMN leaf_hash BLOB", [])?;
+    }
+    Ok(())
+}
+
+/// Compute the missing log leaf hash of every canonical row that has none.
+///
+/// Read in batches rather than all at once: the entry bytes of a large log do not have to be
+/// resident together to derive 32 bytes each. Every write is the same pure function of bytes
+/// already stored, so an interrupted run simply resumes where it stopped.
+fn backfill_leaf_hashes(conn: &Connection) -> MirrorResult<()> {
+    loop {
+        let batch: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT entry_index, envelope FROM entries WHERE leaf_hash IS NULL \
+                 ORDER BY entry_index ASC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([BACKFILL_BATCH], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if batch.is_empty() {
+            return Ok(());
+        }
+        for (index, envelope) in batch {
+            let leaf: Hash = log_leaf_hash(&envelope);
+            conn.execute(
+                "UPDATE entries SET leaf_hash = ?1 WHERE entry_index = ?2",
+                params![leaf.as_slice(), index],
+            )?;
+        }
+    }
+}
+
+/// Rebuild `subtree_roots` from the leaf hashes wherever it does not hold exactly the nodes a
+/// log of the stored size completes.
+///
+/// The expected population is arithmetic, not a guess: a log of `n` entries completes
+/// `n / 2^level` nodes at each level, so comparing the total against the stored row count
+/// detects both a cache that predates this schema and one left short by an interrupted run.
+/// A mismatch rebuilds the whole table, which is cheap relative to the entry bytes already
+/// read to reach it and removes any question of a partially-correct cache.
+fn rebuild_subtree_cache_if_incomplete(conn: &Connection) -> MirrorResult<()> {
+    let overflow = || MirrorError::IndexOverflow { what: "subtree cache population" };
+    let entries: i64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))?;
+    let entries = to_u64("entry count", entries)?;
+    let mut expected: u64 = 0;
+    let mut width: u64 = 2;
+    while width <= entries {
+        expected = expected
+            .checked_add(entries.checked_div(width).ok_or_else(overflow)?)
+            .ok_or_else(overflow)?;
+        let Some(next) = width.checked_mul(2) else { break };
+        width = next;
+    }
+    let stored: i64 = conn.query_row("SELECT COUNT(*) FROM subtree_roots", [], |row| row.get(0))?;
+    if to_u64("subtree row count", stored)? == expected {
+        return Ok(());
+    }
+
+    conn.execute("DELETE FROM subtree_roots", [])?;
+    let mut current = leaf_hashes_range_raw(conn, 0, entries)?;
+    let mut level: u32 = 1;
+    while current.len() >= 2 && level <= MAX_SUBTREE_LEVEL {
+        let mut next = Vec::with_capacity(current.len().checked_div(2).unwrap_or(0));
+        for (node_index, [left, right]) in current.as_chunks::<2>().0.iter().enumerate() {
+            let node = hash_children(left, right);
+            conn.execute(
+                "INSERT INTO subtree_roots (level, node_index, hash) VALUES (?1, ?2, ?3)",
+                params![
+                    level,
+                    to_i64(
+                        "subtree node index",
+                        u64::try_from(node_index).map_err(|_| overflow())?
+                    )?,
+                    node.as_slice()
+                ],
+            )?;
+            next.push(node);
+        }
+        current = next;
+        level = level.checked_add(1).ok_or_else(overflow)?;
+    }
+    Ok(())
 }
 
 /// The `&Connection` core of [`Store::get_entries_range`].
@@ -530,8 +1023,80 @@ pub(crate) fn insert_checkpoint_raw(
     Ok(InsertOutcome::Inserted)
 }
 
+/// The `&Connection` core of [`Store::insert_rotation_checkpoint`].
+pub(crate) fn insert_rotation_checkpoint_raw(
+    conn: &Connection,
+    manifest_entry_index: u64,
+    cp: &Checkpoint,
+) -> MirrorResult<InsertOutcome> {
+    let index_i64 = to_i64("manifest_entry_index", manifest_entry_index)?;
+    let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
+    let existing = row_to_checkpoint(conn.query_row(
+        "SELECT tree_size, log_id, root_hash, checkpoint_time, key_id, signature \
+         FROM rotation_checkpoints WHERE manifest_entry_index = ?1 AND tree_size = ?2 \
+         AND checkpoint_time = ?3",
+        params![index_i64, tree_size_i64, cp.checkpoint_time],
+        checkpoint_row,
+    ))?;
+    if let Some(existing) = existing {
+        if &existing == cp {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
+        return Err(MirrorError::SeriesMemberConflict {
+            tree_size: cp.tree_size,
+            checkpoint_time: cp.checkpoint_time.clone(),
+        });
+    }
+
+    // Keep only anchors that could be served. After a rotation that left the LOG key set alone —
+    // I-D §7.1 makes a change to the witness key objects a rotation on its own — every later
+    // checkpoint of the series qualifies as that rotation's anchor, so recording each one would
+    // grow this table with the series to no purpose: [`Store::get_rotation_checkpoint`] serves
+    // the smallest `(tree_size, checkpoint_time)` and nothing else. A candidate no earlier than
+    // one already held is therefore superseded rather than stored. What IS stored stays: an
+    // earlier candidate arriving later is recorded beside the one it supersedes, never over it,
+    // so the served anchor is the minimum over everything ever offered and does not depend on
+    // the order submissions arrived in.
+    let held: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT tree_size, checkpoint_time FROM rotation_checkpoints \
+             WHERE manifest_entry_index = ?1 ORDER BY tree_size ASC, checkpoint_time ASC LIMIT 1",
+            [index_i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((held_size, held_time)) = held {
+        if (held_size, held_time.as_str()) <= (tree_size_i64, cp.checkpoint_time.as_str()) {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO rotation_checkpoints (manifest_entry_index, tree_size, log_id, root_hash, \
+         checkpoint_time, key_id, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            index_i64,
+            tree_size_i64,
+            cp.log_id,
+            cp.root_hash,
+            cp.checkpoint_time,
+            cp.key_id,
+            cp.signature
+        ],
+    )?;
+    Ok(InsertOutcome::Inserted)
+}
+
 fn checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {
-    let tree_size: i64 = row.get(0)?;
+    checkpoint_row_from(row, 0)
+}
+
+/// Read a checkpoint from six consecutive columns beginning at `base`, in the order every
+/// query in this module selects them: `tree_size, log_id, root_hash, checkpoint_time, key_id,
+/// signature`.
+fn checkpoint_row_from(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<Checkpoint> {
+    let at = |offset: usize| base.saturating_add(offset);
+    let tree_size: i64 = row.get(at(0))?;
     let tree_size = u64::try_from(tree_size).map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
             0,
@@ -540,12 +1105,12 @@ fn checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {
         )
     })?;
     Ok(Checkpoint {
-        log_id: row.get(1)?,
+        log_id: row.get(at(1))?,
         tree_size,
-        root_hash: row.get(2)?,
-        checkpoint_time: row.get(3)?,
-        key_id: row.get(4)?,
-        signature: row.get(5)?,
+        root_hash: row.get(at(2))?,
+        checkpoint_time: row.get(at(3))?,
+        key_id: row.get(at(4))?,
+        signature: row.get(at(5))?,
     })
 }
 
@@ -572,6 +1137,164 @@ mod tests {
             key_id: "sha256:bb".to_owned(),
             signature: "base64:AAAA".to_owned(),
         }
+    }
+
+    fn entry_bytes(n: u64) -> Vec<u8> {
+        ahl_core::jcs(&serde_json::json!({
+            "payload": { "n": n },
+            "signatures": [ { "key_id": "sha256:aa", "sig": "base64:bb" } ],
+        }))
+    }
+
+    /// A store holding `count` canonical entries, promoted in order.
+    fn store_with(count: u64) -> (Store, Vec<Vec<u8>>) {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let mut entries = Vec::new();
+        for index in 0..count {
+            let bytes = entry_bytes(index);
+            let id = ahl_core::sha256_hex(&bytes);
+            store.stage_entry(&id, &bytes).expect("stage");
+            store.promote_entry(index, &id).expect("promote");
+            entries.push(bytes);
+        }
+        (store, entries)
+    }
+
+    #[test]
+    fn promotion_records_the_log_leaf_hash_beside_the_entry() {
+        let (store, entries) = store_with(5);
+        let stored = store.leaf_hashes_range(0, 5).expect("leaf hashes");
+        let expected: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+        assert_eq!(stored, expected);
+        // And the count is answerable without reading a single envelope.
+        assert_eq!(store.count_entries(0, 5).expect("count"), 5);
+        assert_eq!(store.count_entries(0, 99).expect("count"), 5);
+    }
+
+    #[test]
+    fn the_subtree_cache_opens_every_span_of_the_tree() {
+        // 13 is deliberately neither a power of two nor one less than one, so the tree has a
+        // ragged right spine and the cache is exercised alongside the recursion that descends it.
+        let (store, entries) = store_with(13);
+        let leaves: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+        for offset in 0..13usize {
+            let offset_u64 = u64::try_from(offset).expect("small test offset");
+            for size in 1..=(13 - offset) {
+                let expected = atl_core::core::merkle::compute_root(&leaves[offset..offset + size]);
+                let opened = store
+                    .subtree_root(offset_u64, u64::try_from(size).expect("small test size"))
+                    .expect("the store holds every leaf of this span");
+                assert_eq!(opened, expected, "span [{offset}, {})", offset + size);
+            }
+        }
+    }
+
+    #[test]
+    fn a_store_written_before_the_leaf_hash_column_is_migrated_on_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("legacy.sqlite3");
+        let entries: Vec<Vec<u8>> = (0..7u64).map(entry_bytes).collect();
+
+        // The schema exactly as it stood before the derived tree material existed: no
+        // `leaf_hash` column and no `subtree_roots` table at all.
+        {
+            let conn = Connection::open(&path).expect("open legacy database");
+            conn.execute_batch(
+                "CREATE TABLE entries (entry_index INTEGER PRIMARY KEY, \
+                 entry_id TEXT NOT NULL UNIQUE, envelope BLOB NOT NULL);",
+            )
+            .expect("legacy schema");
+            for (index, bytes) in entries.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO entries (entry_index, entry_id, envelope) VALUES (?1, ?2, ?3)",
+                    params![
+                        i64::try_from(index).expect("small test index"),
+                        ahl_core::sha256_hex(bytes),
+                        bytes
+                    ],
+                )
+                .expect("legacy row");
+            }
+        }
+
+        let store = Store::open(&path).expect("migrate on open");
+        let expected: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+        assert_eq!(store.leaf_hashes_range(0, 7).expect("backfilled"), expected);
+        assert_eq!(
+            store.subtree_root(0, 7).expect("cache rebuilt"),
+            atl_core::core::merkle::compute_root(&expected)
+        );
+        // Running the migration again is a no-op rather than a second rebuild.
+        let reopened = Store::open(&path).expect("reopen");
+        assert_eq!(
+            reopened.subtree_root(0, 7).expect("cache"),
+            atl_core::core::merkle::compute_root(&expected)
+        );
+    }
+
+    #[test]
+    fn a_truncated_subtree_cache_is_rebuilt_on_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("short-cache.sqlite3");
+        let entries: Vec<Vec<u8>> = (0..9u64).map(entry_bytes).collect();
+        {
+            let store = Store::open(&path).expect("open");
+            for (index, bytes) in entries.iter().enumerate() {
+                let id = ahl_core::sha256_hex(bytes);
+                store.stage_entry(&id, bytes).expect("stage");
+                store
+                    .promote_entry(u64::try_from(index).expect("small test index"), &id)
+                    .expect("promote");
+            }
+            store
+                .with_conn(|conn| {
+                    conn.execute("DELETE FROM subtree_roots WHERE level = 1", [])?;
+                    Ok(())
+                })
+                .expect("truncate the cache behind the store's back");
+        }
+        let store = Store::open(&path).expect("reopen");
+        let expected: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+        assert_eq!(
+            store.subtree_root(0, 9).expect("cache rebuilt"),
+            atl_core::core::merkle::compute_root(&expected)
+        );
+    }
+
+    /// Promotion is two writes — the canonical row and the complete-subtree roots it completes
+    /// — and they land together or not at all. Injected here by removing the cache table behind
+    /// the store's back, which is the one failure the second write can have that the first
+    /// cannot: without the transaction the entry row would commit and the store would carry a
+    /// leaf whose tree material never recorded it.
+    #[test]
+    fn a_failed_cache_write_rolls_the_promotion_back() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let first = entry_bytes(0);
+        let first_id = ahl_core::sha256_hex(&first);
+        store.stage_entry(&first_id, &first).expect("stage");
+        store.promote_entry(0, &first_id).expect("promote the first entry");
+
+        // Promoting index 1 makes the leaf count 2, which completes the level-1 node — so this
+        // is the promotion whose second write has somewhere to fail.
+        store
+            .with_conn(|conn| {
+                conn.execute("DROP TABLE subtree_roots", [])?;
+                Ok(())
+            })
+            .expect("remove the cache table");
+
+        let second = entry_bytes(1);
+        let second_id = ahl_core::sha256_hex(&second);
+        store.stage_entry(&second_id, &second).expect("stage");
+        assert!(
+            store.promote_entry(1, &second_id).is_err(),
+            "the cache write fails, so the promotion fails"
+        );
+
+        // And it left nothing behind: the index is still free, and the store still ends at 1.
+        assert_eq!(store.next_index().expect("next index"), 1);
+        assert!(store.get_entry_by_id(&second_id).expect("query").is_none());
+        assert_eq!(store.count_entries(0, 99).expect("count"), 1);
     }
 
     #[test]

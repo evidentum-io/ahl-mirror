@@ -165,6 +165,27 @@ pub enum MirrorError {
         need: u64,
     },
 
+    /// A node of the log tree the store should hold is absent: an entry row carrying no log
+    /// leaf hash (`level` 0), or a complete-subtree root missing from the cache. Both are
+    /// derived from entry bytes the store already holds and are rebuilt by the migration on
+    /// open, so an absence at serving time is a storage integrity fault, not a client mistake.
+    #[error("log tree material at level {level}, node {node_index} is missing from the store")]
+    TreeMaterialMissing {
+        /// The tree level (0 for a leaf hash).
+        level: u32,
+        /// The node's index at that level.
+        node_index: u64,
+    },
+
+    /// A stored log-tree node is present but is not 32 octets. A storage integrity fault.
+    #[error("log tree material at level {level}, node {node_index} is not a 32-octet hash")]
+    TreeMaterialCorrupt {
+        /// The tree level (0 for a leaf hash).
+        level: u32,
+        /// The node's index at that level.
+        node_index: u64,
+    },
+
     /// The stored entries for `[0, tree_size)` do not recompute to the checkpoint's
     /// `root_hash`. A storage integrity fault; never served to a caller.
     #[error("stored entries for tree_size {tree_size} do not recompute to its root_hash")]
@@ -317,6 +338,35 @@ pub enum MirrorError {
     /// start without at least one out-of-band trusted producer key (core spec §2.3.5).
     #[error("configuration declares no genesis producer keys")]
     NoGenesisProducerKeys,
+
+    /// A checkpoint that did not verify under the state active for its own `tree_size` is
+    /// not ROTATION-ANCHORING material either, so I-D §7.1's transition exception does not
+    /// reach it.
+    ///
+    /// Never the error a submission is refused with: the exception is a second chance, so a
+    /// checkpoint that fails it is reported with the failure it earned under the ordinary rule
+    /// (see [`crate::checkpoint::ingest_checkpoint`]). This variant names why the second chance
+    /// did not apply, for the caller that asks the classification directly.
+    #[error(
+        "checkpoint at tree_size {tree_size} is not rotation-anchoring material for the \
+         manifest at entry index {manifest_entry_index}: {reason}"
+    )]
+    NotRotationMaterial {
+        /// The submitted checkpoint's `tree_size`.
+        tree_size: u64,
+        /// The entry index of the manifest version active for that `tree_size`.
+        manifest_entry_index: u64,
+        /// Which condition of I-D §7.1 was not met.
+        reason: &'static str,
+    },
+
+    /// No rotation-anchoring checkpoint is held for the rotation anchored at this entry index
+    /// (I-D §7.1).
+    #[error("no rotation-anchoring checkpoint is held for the manifest at entry index {manifest_entry_index}")]
+    UnknownRotationProof {
+        /// The requested rotating manifest's entry index.
+        manifest_entry_index: u64,
+    },
 
     /// A checkpoint's signature does not verify against its resolved key.
     #[error("checkpoint signature does not verify against key `{key_id}`")]

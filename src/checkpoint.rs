@@ -22,7 +22,6 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 use crate::config::Config;
 use crate::error::{MirrorError, MirrorResult};
 use crate::manifest::{self, GovernanceState};
-use crate::metadata::log_leaf_hash;
 use crate::store::Store;
 
 /// ATL's fixed 98-byte checkpoint magic (adaptor profile §6.1).
@@ -346,14 +345,18 @@ pub fn verify_series_consistency(
 /// The `&Connection` core of [`leaf_hashes_for`] — usable inside a transaction (see
 /// [`ingest_checkpoint`]), where calling [`leaf_hashes_for`] itself would deadlock by
 /// re-locking the store's mutex.
+///
+/// Reads the leaf hashes the store recorded at promotion (adaptor profile §4.2) rather than
+/// re-deriving them from entry bytes: the two are the same function of the same bytes, and the
+/// stored form is 32 octets per entry instead of a whole envelope.
 fn leaf_hashes_for_conn(conn: &rusqlite::Connection, tree_size: u64) -> MirrorResult<Vec<Hash>> {
-    let entries = crate::store::get_entries_range_raw(conn, 0, tree_size)?;
-    let have = u64::try_from(entries.len())
+    let hashes = crate::store::leaf_hashes_range_raw(conn, 0, tree_size)?;
+    let have = u64::try_from(hashes.len())
         .map_err(|_| MirrorError::IndexOverflow { what: "entries.len()" })?;
     if have != tree_size {
         return Err(MirrorError::IncompleteEntries { have, need: tree_size });
     }
-    Ok(entries.iter().map(|bytes| log_leaf_hash(bytes)).collect())
+    Ok(hashes)
 }
 
 /// Fetch the complete, contiguous log-leaf-hash sequence for `[0, tree_size)`, or report how
@@ -443,6 +446,127 @@ fn build_visible_prefix(
     Ok(prefix)
 }
 
+/// What a submitted checkpoint was admitted as.
+///
+/// The two records are independent, and a checkpoint can earn BOTH. A series member verifies
+/// under the manifest version active for its own `tree_size`; a rotation anchor verifies under
+/// the OUTGOING state of some rotation the prefix contains. Those coincide exactly when the
+/// rotation did NOT replace the log key set — I-D §7.1 makes a change to the WITNESS key
+/// objects a governance-key rotation on its own, and after such a rotation the log key set is
+/// unchanged, so the ordinary checkpoints of the series are themselves the material a
+/// `rotation_proofs[]` element needs.
+///
+/// The two records point at ONE checkpoint. `checkpoints` and `rotation_checkpoints` hold the
+/// same six members, so a dual admission stores the object twice and contradicts itself in
+/// neither: the series routes read the first table, the rotation route the second, and
+/// equivocation detection reads both (see [`series_view`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admission {
+    /// Whether it entered the canonical checkpoint series (adaptor profile §5.2.2).
+    pub series_member: bool,
+    /// The rotations it anchors, by rotating-manifest entry index, ascending (I-D §7.1).
+    ///
+    /// A rotation appears here when this checkpoint QUALIFIES as its anchor, whether or not the
+    /// store went on to record a row for it: [`crate::store::Store::insert_rotation_checkpoint`]
+    /// keeps only anchors that could be served, so a later checkpoint for a rotation already
+    /// anchored earlier qualifies and is superseded rather than stored.
+    pub rotation_anchors: Vec<u64>,
+}
+
+/// One governance-key rotation the entry prefix contains.
+struct Rotation<'a> {
+    /// The entry index of the ROTATING manifest.
+    manifest_entry_index: u64,
+    /// The state of the version PRECEDING it — the outgoing state I-D §7.1 names.
+    outgoing: &'a GovernanceState,
+}
+
+/// Every governance-key rotation in `versions` (I-D §7.1: "a manifest version whose LOG
+/// checkpoint-signing key objects OR whose WITNESS key objects differ from those of its
+/// predecessor in the chain"), paired with the predecessor it retires.
+fn rotations_in(versions: &[GovernanceState]) -> Vec<Rotation<'_>> {
+    versions
+        .windows(2)
+        .filter_map(|pair| {
+            let [outgoing, incoming] = pair else { return None };
+            incoming.rotates(outgoing).then(|| Rotation {
+                manifest_entry_index: incoming.governing_manifest_entry_index(),
+                outgoing,
+            })
+        })
+        .collect()
+}
+
+/// Every rotation `cp` is ROTATION-ANCHORING material for, ascending by rotating-manifest entry
+/// index (I-D §7.1's transition exception).
+///
+/// The search is over EVERY rotation the prefix contains, not merely the version active for
+/// `cp.tree_size`, because §7.1 says the active version for such a checkpoint "is the rotating
+/// manifest or a later one" — a checkpoint may sit several rotations past the one it anchors,
+/// and what it must verify under is that rotation's own predecessor. A rotation at index `m`
+/// qualifies when:
+///
+/// 1. `cp.tree_size` is GREATER than `m` — §7.1: the element's checkpoint `tree_size` "MUST be
+///    GREATER than `manifest_entry_index`". Below that bound the outgoing state IS the active
+///    state and no exception is needed;
+/// 2. `cp` verifies under a log key of the version PRECEDING `m` — §7.1: "MUST verify under a
+///    key of the OUTGOING log key set — the log key objects of the manifest version preceding
+///    the rotating one".
+///
+/// `named` is the `manifest_entry_index` a submission asserted. It NARROWS NOTHING: every
+/// rotation the checkpoint qualifies for is discovered and returned either way, because what a
+/// checkpoint anchors is a fact about the log and not about what the submitter happened to know.
+/// What naming changes is the report — a name absent from the discovered set is an error saying
+/// why, rather than an admission that quietly anchors something else.
+///
+/// This is STRICTLY HARDER to satisfy than the general rule, which is why §7.1 calls it safe:
+/// the general rule would accept the INCOMING key, "exactly the key an attacker installs",
+/// whereas this accepts only the key being retired.
+fn rotation_anchors_for(
+    versions: &[GovernanceState],
+    config: &Config,
+    cp: &Checkpoint,
+    raw: Option<&[u8]>,
+    named: Option<u64>,
+) -> MirrorResult<Vec<u64>> {
+    let mut anchored = Vec::new();
+    let mut named_failure: Option<&'static str> = None;
+    for rotation in rotations_in(versions) {
+        let index = rotation.manifest_entry_index;
+        let qualifies = if cp.tree_size <= index {
+            Err("the checkpoint's tree_size is not greater than the manifest entry index")
+        } else if rotation
+            .outgoing
+            .resolve_log_key(&cp.key_id, cp.tree_size)
+            .and_then(|key| verify_checkpoint_signature(cp, raw, &config.log_id, key))
+            .is_err()
+        {
+            Err("the checkpoint does not verify under a log key of the version preceding the \
+                 rotating one")
+        } else {
+            Ok(())
+        };
+        match qualifies {
+            Ok(()) => anchored.push(index),
+            Err(reason) if named == Some(index) => named_failure = Some(reason),
+            Err(_) => {}
+        }
+    }
+    if let Some(manifest_entry_index) = named {
+        if !anchored.contains(&manifest_entry_index) {
+            return Err(MirrorError::NotRotationMaterial {
+                tree_size: cp.tree_size,
+                manifest_entry_index,
+                reason: named_failure.unwrap_or(
+                    "the manifest version at that entry index is not a governance-key rotation \
+                     of its predecessor",
+                ),
+            });
+        }
+    }
+    Ok(anchored)
+}
+
 /// Verify and admit `cp` as an **authenticated** checkpoint (core spec §7.3).
 ///
 /// The pipeline, in order:
@@ -490,7 +614,8 @@ pub fn ingest_checkpoint(
     cp: &Checkpoint,
     raw: Option<&[u8]>,
     entries_to_promote: &[PendingPromotion],
-) -> MirrorResult<()> {
+    rotation_for: Option<u64>,
+) -> MirrorResult<Admission> {
     if cp.tree_size > MAX_TREE_SIZE {
         return Err(MirrorError::TreeSizeUnrepresentable {
             tree_size: cp.tree_size,
@@ -500,9 +625,31 @@ pub fn ingest_checkpoint(
     let claimed_root: Hash = ahl_core::parse_hash_hex(&cp.root_hash)?;
     let prefix = build_visible_prefix(store, entries_to_promote, cp.tree_size, &claimed_root)?;
 
-    let governance = manifest::resolve(&prefix, config)?;
-    let key = governance.resolve_log_key(&cp.key_id, cp.tree_size)?;
-    verify_checkpoint_signature(cp, raw, &config.log_id, key)?;
+    let versions = manifest::versions(&prefix, config)?;
+    let governance = versions
+        .last()
+        .ok_or(MirrorError::GovernanceChainUnresolvable { tree_size: cp.tree_size })?;
+
+    // The two questions are asked independently, because a checkpoint can be the answer to
+    // both. The ordinary rule is the key state active for this checkpoint's own `tree_size`
+    // (I-D §7.1's general rule); the transition exception is asked of every rotation the prefix
+    // contains. Where the ordinary rule passes and no rotation matches, this is exactly the
+    // series member it always was; where the ordinary rule fails and a rotation matches, it is
+    // rotation material and nothing else; and where BOTH hold — which is what a rotation that
+    // replaced only the WITNESS key objects produces, since the log key set it verifies under
+    // did not move — it is recorded as both.
+    let under_active_version = governance
+        .resolve_log_key(&cp.key_id, cp.tree_size)
+        .and_then(|key| verify_checkpoint_signature(cp, raw, &config.log_id, key));
+    let series_member = under_active_version.is_ok();
+    let rotation_anchors = rotation_anchors_for(&versions, config, cp, raw, rotation_for)?;
+    if !series_member && rotation_anchors.is_empty() {
+        // Neither: report the failure it earned under the ORDINARY rule. The exception is a
+        // second chance, so naming it in the rejection would misdescribe what was failed.
+        return under_active_version
+            .map(|()| Admission { series_member: true, rotation_anchors: Vec::new() });
+    }
+    let admission = Admission { series_member, rotation_anchors };
 
     store.with_transaction(|conn| {
         for pending in entries_to_promote {
@@ -521,8 +668,13 @@ pub fn ingest_checkpoint(
             }
         }
 
-        crate::store::insert_checkpoint_raw(conn, cp)?;
-        Ok(())
+        if admission.series_member {
+            crate::store::insert_checkpoint_raw(conn, cp)?;
+        }
+        for manifest_entry_index in &admission.rotation_anchors {
+            crate::store::insert_rotation_checkpoint_raw(conn, *manifest_entry_index, cp)?;
+        }
+        Ok(admission.clone())
     })
 }
 
@@ -750,7 +902,19 @@ pub fn series_view(store: &Store, config: &Config) -> MirrorResult<SeriesView> {
         .filter(|m| m.state == CheckpointState::SeriesUsable)
         .map(|m| m.checkpoint.clone())
         .collect();
-    let root_divergences = find_root_divergences(&all);
+    // Core spec §7.3's "members sharing a `tree_size` MUST carry the same `root_hash`" is a
+    // rule about what this LOG published, not about which table this mirror filed it in. A
+    // rotation-anchoring checkpoint is held apart from the series (I-D §7.1; see
+    // [`crate::store`]) and is never reported as a member above, but it is an authenticated
+    // checkpoint of the same log at some `tree_size`, so a root it contradicts a member with is
+    // equivocation and MUST be found. The scan therefore runs over both, re-ordered by
+    // `(tree_size, checkpoint_time)` so that conflicting members at one size stay adjacent.
+    let mut authenticated = all;
+    authenticated.extend(store.all_rotation_checkpoints()?.into_iter().map(|(_, cp)| cp));
+    authenticated.sort_by(|a, b| {
+        a.tree_size.cmp(&b.tree_size).then_with(|| a.checkpoint_time.cmp(&b.checkpoint_time))
+    });
+    let root_divergences = find_root_divergences(&authenticated);
     let equivocation_floor = root_divergences.iter().min().copied();
     let GapFreeResult { frontier: gap_free_frontier, stop: frontier_stop } =
         compute_gap_free_frontier(store, config, &usable_checkpoints, equivocation_floor)?;
@@ -794,6 +958,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ConfigSpec, KeyObjectSpec};
+    use crate::metadata::log_leaf_hash;
 
     fn signed_checkpoint(
         key: &ahl_core::TestKey,
@@ -1100,6 +1265,422 @@ mod tests {
         signed_checkpoint(key, log_id, tree_size, &format!("sha256:{}", hex::encode(root)), time)
     }
 
+    fn witness_block(key: &ahl_core::TestKey) -> serde_json::Value {
+        serde_json::json!([{
+            "witness_id": "witness-1",
+            "keys": [
+                { "key_id": key.key_id(), "pubkey": key.pubkey(), "valid_from_index": 0 }
+            ],
+        }])
+    }
+
+    /// A manifest version declaring `log_key` and `witness`, linked to `predecessor` where it
+    /// has one.
+    fn version_payload(
+        log_id: &str,
+        producer: &ahl_core::TestKey,
+        log_key: &ahl_core::TestKey,
+        witness: &ahl_core::TestKey,
+        predecessor: Option<&str>,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
+            "producer": "producer-1",
+            "keys": [
+                { "key_id": producer.key_id(), "pubkey": producer.pubkey(), "valid_from_index": 0 }
+            ],
+            "log": {
+                "log_id": log_id,
+                "operator": "op-1",
+                "adaptor": { "id": "ahl-adaptor-atl-v1", "hash": "sha256:00" },
+                "checkpoint_cadence": "PT5M",
+                "cadence_epoch": "2026-01-01T00:00:00Z",
+                "witness_grace_period": "PT10M",
+                "keys": [
+                    { "key_id": log_key.key_id(), "pubkey": log_key.pubkey(), "valid_from_index": 0 }
+                ],
+            },
+            "witnesses": witness_block(witness),
+        });
+        if let Some(predecessor) = predecessor {
+            payload["predecessor"] = serde_json::json!(predecessor);
+        }
+        payload
+    }
+
+    /// A log whose manifest chain is exactly `spec`: one version per element, anchored at that
+    /// element's own entry index, declaring the log key and witness key its seeds name — plus
+    /// one ordinary entry after them, so a checkpoint can sit past every version.
+    ///
+    /// Which consecutive pairs are governance-key rotations is therefore entirely the caller's
+    /// choice: repeat a log seed to hold the log key set still, repeat a witness seed to hold
+    /// the witness key set still, repeat both for a version that rotates nothing.
+    struct ChainFixture {
+        store: Store,
+        config: Config,
+        log_keys: Vec<ahl_core::TestKey>,
+        entries: Vec<Vec<u8>>,
+        root: Hash,
+        tree_size: u64,
+    }
+
+    fn chain_fixture(seed: u8, spec: &[(u8, u8)]) -> ChainFixture {
+        let key = |tag: &'static str, byte: u8| {
+            ahl_core::TestKey::from_seed_hex(tag, &format!("{byte:02x}").repeat(32)).expect("seed")
+        };
+        let producer = key("producer", seed);
+        let log_id = format!("sha256:{}", format!("{seed:02x}").repeat(32));
+        let log_keys: Vec<_> = spec.iter().map(|(log, _)| key("log", *log)).collect();
+        let witnesses: Vec<_> = spec.iter().map(|(_, w)| key("witness", *w)).collect();
+
+        let mut entries: Vec<Vec<u8>> = Vec::new();
+        let mut predecessor: Option<String> = None;
+        for (index, log_key) in log_keys.iter().enumerate() {
+            let witness = witnesses.get(index).expect("one witness seed per version");
+            let bytes = stored_entry(
+                version_payload(&log_id, &producer, log_key, witness, predecessor.as_deref()),
+                &producer,
+            );
+            predecessor = Some(entry_id_of(&bytes));
+            entries.push(bytes);
+        }
+        entries.push(stored_entry(
+            serde_json::json!({ "type": "ingestion", "ahl_version": ahl_core::AHL_VERSION }),
+            &producer,
+        ));
+
+        let leaves: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+        let root = compute_root(&leaves);
+        let tree_size = u64::try_from(entries.len()).expect("small test size");
+
+        let store = Store::open_in_memory().expect("in-memory store");
+        let genesis_id = entry_id_of(&entries[0]);
+        store.stage_entry(&genesis_id, &entries[0]).expect("stage genesis");
+        store.promote_entry(0, &genesis_id).expect("promote genesis");
+        stage_and_promote_at(&store, tree_size, root, &entries[1..], 1);
+
+        let config = Config::resolve(&ConfigSpec {
+            log_id,
+            genesis_manifest_entry_id: genesis_id,
+            genesis_producer_keys: vec![KeyObjectSpec {
+                key_id: producer.key_id(),
+                pubkey: producer.pubkey(),
+                valid_from_index: 0,
+            }],
+            store_path: ":memory:".to_owned(),
+        })
+        .expect("valid config");
+
+        ChainFixture { store, config, log_keys, entries, root, tree_size }
+    }
+
+    impl ChainFixture {
+        /// A checkpoint over the whole tree, signed by the log key of version `signer`.
+        fn signed_by(&self, signer: usize, time: &str) -> Checkpoint {
+            checkpoint_for(
+                self.log_keys.get(signer).expect("a version in the fixture"),
+                &self.config.log_id,
+                self.tree_size,
+                self.root,
+                time,
+            )
+        }
+
+        fn admit(&self, cp: &Checkpoint, rotation_for: Option<u64>) -> MirrorResult<Admission> {
+            ingest_checkpoint(&self.store, &self.config, cp, None, &[], rotation_for)
+        }
+    }
+
+    /// The entry index the rotating manifest is anchored at in the single-rotation fixtures.
+    const ROTATING_INDEX: u64 = 1;
+
+    /// I-D §7.1: a checkpoint whose `tree_size` is GREATER than the rotating manifest's entry
+    /// index and which verifies under a key of the OUTGOING log key set is rotation-anchoring
+    /// material. It is held, and it is held APART from the canonical series.
+    #[test]
+    fn an_outgoing_key_checkpoint_past_a_rotation_is_held_as_rotation_material() {
+        // Version 1 replaces the log key: a checkpoint under version 0's key does not verify
+        // under the active version at all.
+        let fx = chain_fixture(0x40, &[(0x41, 0x4f), (0x42, 0x4f)]);
+        let cp = fx.signed_by(0, "2026-01-01T00:02:00.000000000Z");
+
+        let admitted = fx.admit(&cp, None).expect("accepted under the outgoing state");
+        assert_eq!(
+            admitted,
+            Admission { series_member: false, rotation_anchors: vec![ROTATING_INDEX] }
+        );
+
+        let held = fx
+            .store
+            .get_rotation_checkpoint(ROTATING_INDEX)
+            .expect("query")
+            .expect("held for this rotation");
+        assert_eq!(held, cp);
+        assert!(fx.store.get_rotation_checkpoint(0).expect("query").is_none());
+
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert!(
+            view.members.is_empty(),
+            "rotation material must not appear in the canonical checkpoint series"
+        );
+        assert_eq!(view.gap_free_frontier, None);
+        assert!(itub(&view, 0).is_none());
+    }
+
+    /// The same log, the same size, the INCOMING key: an ordinary series member, admitted by
+    /// the general rule and anchoring nothing.
+    #[test]
+    fn an_incoming_key_checkpoint_past_a_rotation_is_an_ordinary_series_member() {
+        let fx = chain_fixture(0x44, &[(0x45, 0x4f), (0x46, 0x4f)]);
+        let cp = fx.signed_by(1, "2026-01-01T00:02:00.000000000Z");
+
+        assert_eq!(
+            fx.admit(&cp, None).expect("accepted"),
+            Admission { series_member: true, rotation_anchors: Vec::new() }
+        );
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert_eq!(view.members.len(), 1);
+        assert_eq!(view.members[0].checkpoint, cp);
+        assert!(fx.store.get_rotation_checkpoint(ROTATING_INDEX).expect("query").is_none());
+    }
+
+    /// I-D §7.1 makes a change to the WITNESS key objects a governance-key rotation on its own,
+    /// and such a rotation leaves the log key set alone — so the ordinary checkpoints of the
+    /// series are themselves what a `rotation_proofs[]` element needs. One checkpoint, two
+    /// records: it enters the series by the general rule AND anchors the rotation by the
+    /// exception, and the two are served from their own routes without either shadowing the
+    /// other.
+    #[test]
+    fn a_witness_only_rotation_makes_an_ordinary_checkpoint_a_rotation_anchor_too() {
+        // The log key is held still across the versions; only the witness key object moves.
+        let fx = chain_fixture(0x54, &[(0x55, 0x56), (0x55, 0x57)]);
+        let cp = fx.signed_by(1, "2026-01-01T00:02:00.000000000Z");
+
+        assert_eq!(
+            fx.admit(&cp, None).expect("accepted"),
+            Admission { series_member: true, rotation_anchors: vec![ROTATING_INDEX] },
+            "the log key set did not move, so one checkpoint satisfies both rules"
+        );
+
+        // Both records point at the same checkpoint, and each route reads its own table.
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert_eq!(view.members.len(), 1);
+        assert_eq!(view.members[0].checkpoint, cp);
+        assert_eq!(fx.store.get_rotation_checkpoint(ROTATING_INDEX).expect("query"), Some(cp));
+        // Two records of one root at one size is not equivocation.
+        assert!(view.root_divergences.is_empty());
+        assert_eq!(view.equivocation_floor, None);
+    }
+
+    /// I-D §7.1: the version active for a rotation proof's checkpoint "is the rotating manifest
+    /// OR A LATER ONE", so a checkpoint sitting several rotations past the one it anchors must
+    /// be matched against THAT rotation's own predecessor, not against the state at the end of
+    /// the prefix. Three versions, two adjacent rotations, and each retired key anchors the
+    /// rotation that retired it.
+    #[test]
+    fn a_checkpoint_past_two_rotations_anchors_the_one_its_own_key_retires() {
+        // Versions at entry indexes 0, 1 and 2; both hops rotate the log key.
+        let fx = chain_fixture(0x58, &[(0x59, 0x5f), (0x5a, 0x5f), (0x5b, 0x5f)]);
+        assert_eq!(fx.tree_size, 4, "three versions and one ordinary entry");
+
+        // Version 0's key was retired by the rotation at entry 1.
+        assert_eq!(
+            fx.admit(&fx.signed_by(0, "2026-01-01T00:02:00.000000000Z"), None).expect("v0"),
+            Admission { series_member: false, rotation_anchors: vec![1] }
+        );
+        // Version 1's key was retired by the rotation at entry 2 — a checkpoint past BOTH
+        // rotations, anchoring the second.
+        assert_eq!(
+            fx.admit(&fx.signed_by(1, "2026-01-01T00:03:00.000000000Z"), None).expect("v1"),
+            Admission { series_member: false, rotation_anchors: vec![2] }
+        );
+        // Version 2's key is the active one: an ordinary series member.
+        assert_eq!(
+            fx.admit(&fx.signed_by(2, "2026-01-01T00:04:00.000000000Z"), None).expect("v2"),
+            Admission { series_member: true, rotation_anchors: Vec::new() }
+        );
+
+        assert_eq!(
+            fx.store.get_rotation_checkpoint(1).expect("query").map(|cp| cp.key_id),
+            Some(fx.log_keys[0].key_id())
+        );
+        assert_eq!(
+            fx.store.get_rotation_checkpoint(2).expect("query").map(|cp| cp.key_id),
+            Some(fx.log_keys[1].key_id())
+        );
+    }
+
+    /// A submission MAY name the rotation it is offered for. Naming one changes nothing about
+    /// what is accepted — the search runs either way — but a named rotation the checkpoint does
+    /// not in fact anchor is refused with the reason, rather than being quietly admitted as an
+    /// ordinary member that anchors nothing.
+    #[test]
+    fn a_named_rotation_the_checkpoint_does_not_anchor_is_refused() {
+        let fx = chain_fixture(0x5c, &[(0x5d, 0x6f), (0x5e, 0x6f), (0x60, 0x6f)]);
+        let cp = fx.signed_by(0, "2026-01-01T00:02:00.000000000Z");
+
+        // It anchors the rotation at entry 1, and says so when asked.
+        assert_eq!(
+            fx.admit(&cp, Some(1)).expect("named correctly"),
+            Admission { series_member: false, rotation_anchors: vec![1] }
+        );
+        // It does not anchor the rotation at entry 2, whose predecessor is version 1.
+        assert!(matches!(
+            fx.admit(&cp, Some(2)),
+            Err(MirrorError::NotRotationMaterial { manifest_entry_index: 2, .. })
+        ));
+        // And there is no rotation at entry 0 at all: the genesis manifest retires nothing.
+        assert!(matches!(
+            fx.admit(&cp, Some(0)),
+            Err(MirrorError::NotRotationMaterial { manifest_entry_index: 0, .. })
+        ));
+    }
+
+    /// Naming a rotation NARROWS NOTHING. A checkpoint under an unchanged log key can anchor
+    /// several witness-set rotations at once, and it anchors all of them whether the submitter
+    /// named one, another, or none: what a checkpoint anchors is a fact about the log, not about
+    /// what the submitter knew. Storing only the named one would leave the others' proofs
+    /// unheld while reporting success.
+    #[test]
+    fn naming_one_rotation_still_anchors_every_rotation_the_checkpoint_fits() {
+        // The log key is held still across three versions while the witness key moves twice:
+        // two governance-key rotations, at entry indexes 1 and 2, and one checkpoint under the
+        // unchanged log key qualifies for both.
+        let fx = chain_fixture(0x90, &[(0x91, 0x92), (0x91, 0x93), (0x91, 0x94)]);
+        let cp = fx.signed_by(2, "2026-01-01T00:02:00.000000000Z");
+
+        assert_eq!(
+            fx.admit(&cp, Some(1)).expect("named one of the two"),
+            Admission { series_member: true, rotation_anchors: vec![1, 2] },
+            "both rotations are anchored, and the report names both"
+        );
+        assert_eq!(fx.store.get_rotation_checkpoint(1).expect("query"), Some(cp.clone()));
+        assert_eq!(fx.store.get_rotation_checkpoint(2).expect("query"), Some(cp));
+    }
+
+    /// I-D §7.1 requires a rotation proof's `tree_size` to be GREATER than
+    /// `manifest_entry_index`, and the reason it can be is that at or below that index the
+    /// outgoing state IS the active state: a checkpoint there needs no exception, and gets
+    /// none. It is an ordinary series member and is not held as rotation material.
+    #[test]
+    fn an_outgoing_key_checkpoint_at_or_below_the_rotating_index_is_not_rotation_material() {
+        let fx = chain_fixture(0x48, &[(0x49, 0x4e), (0x4a, 0x4e)]);
+        let genesis_leaf = log_leaf_hash(&fx.entries[0]);
+        let cp = checkpoint_for(
+            &fx.log_keys[0],
+            &fx.config.log_id,
+            ROTATING_INDEX,
+            compute_root(&[genesis_leaf]),
+            "2026-01-01T00:01:00.000000000Z",
+        );
+
+        assert_eq!(
+            fx.admit(&cp, None).expect("accepted"),
+            Admission { series_member: true, rotation_anchors: Vec::new() },
+            "the version active for tree_size 1 is the genesis manifest, whose log key this is"
+        );
+        assert!(fx.store.get_rotation_checkpoint(ROTATING_INDEX).expect("query").is_none());
+
+        // And the guard itself, asked directly: the exception does not reach this size.
+        let prefix = fx.store.get_entries_range(0, fx.tree_size).expect("prefix");
+        let versions = manifest::versions(&prefix, &fx.config).expect("governance");
+        assert!(matches!(
+            rotation_anchors_for(&versions, &fx.config, &cp, None, Some(ROTATING_INDEX)),
+            Err(MirrorError::NotRotationMaterial { manifest_entry_index: ROTATING_INDEX, .. })
+        ));
+    }
+
+    /// The exception applies only where a version is a GOVERNANCE-KEY ROTATION. Under a chain
+    /// that replaces neither key set, a checkpoint that does not verify is simply a checkpoint
+    /// that does not verify — and it is refused with THAT failure, not with a rotation
+    /// diagnosis it never earned.
+    #[test]
+    fn a_checkpoint_failing_under_a_non_rotating_version_is_refused_not_retried() {
+        // Both versions declare the same log key and the same witness key: no rotation.
+        let fx = chain_fixture(0x4c, &[(0x4d, 0x50), (0x4d, 0x50)]);
+        let prefix = fx.store.get_entries_range(0, fx.tree_size).expect("prefix");
+        let versions = manifest::versions(&prefix, &fx.config).expect("governance");
+        assert_eq!(versions.len(), 2, "two versions were installed");
+        assert!(!versions[1].rotates(&versions[0]), "neither key set changed");
+
+        let stranger =
+            ahl_core::TestKey::from_seed_hex("stranger", &"51".repeat(32)).expect("seed");
+        let cp = checkpoint_for(
+            &stranger,
+            &fx.config.log_id,
+            fx.tree_size,
+            fx.root,
+            "2026-01-01T00:02:00.000000000Z",
+        );
+        assert!(rotation_anchors_for(&versions, &fx.config, &cp, None, None)
+            .expect("no rotation to search")
+            .is_empty());
+        assert!(
+            matches!(fx.admit(&cp, None), Err(MirrorError::UnknownSigningKey { .. })),
+            "refused with the failure it earned under the ordinary rule"
+        );
+    }
+
+    /// A rotation-anchoring checkpoint is stored apart from the series, but it is still a
+    /// checkpoint this log published. Two roots at one `tree_size` is equivocation whichever
+    /// table each is filed in (core spec §7.3), and the existing equivocation path reports it.
+    #[test]
+    fn a_rotation_checkpoint_contradicting_a_series_member_is_equivocation() {
+        let fx = chain_fixture(0x50, &[(0x52, 0x53), (0x61, 0x53)]);
+        // A size the store does not reach, so neither checkpoint's root is recomputable and
+        // both are admitted as merely authenticated — which is what lets two roots coexist
+        // long enough to be compared.
+        let series = checkpoint_for(
+            &fx.log_keys[1],
+            &fx.config.log_id,
+            9,
+            [0x11; 32],
+            "2026-01-01T00:03:00.000000000Z",
+        );
+        let rotation = checkpoint_for(
+            &fx.log_keys[0],
+            &fx.config.log_id,
+            9,
+            [0x22; 32],
+            "2026-01-01T00:04:00.000000000Z",
+        );
+        assert!(fx.admit(&series, None).expect("series").series_member);
+        assert_eq!(
+            fx.admit(&rotation, None).expect("rotation").rotation_anchors,
+            vec![ROTATING_INDEX]
+        );
+
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert_eq!(view.root_divergences, vec![9]);
+        assert_eq!(view.equivocation_floor, Some(9));
+    }
+
+    /// Only anchors that could be served are kept, and which one is served does not depend on
+    /// the order submissions arrived in: the store holds the strictly-improving ones and the
+    /// route reads the minimum.
+    #[test]
+    fn the_earliest_anchor_is_served_whatever_order_anchors_arrive_in() {
+        let fx = chain_fixture(0x62, &[(0x63, 0x6a), (0x64, 0x6a)]);
+        let later = fx.signed_by(0, "2026-01-01T00:09:00.000000000Z");
+        let earlier = fx.signed_by(0, "2026-01-01T00:02:00.000000000Z");
+
+        // Later first: recorded, because nothing is held for this rotation yet.
+        assert_eq!(fx.admit(&later, None).expect("later").rotation_anchors, vec![ROTATING_INDEX]);
+        // Earlier second: recorded BESIDE it, never over it, and it is what is served.
+        assert_eq!(
+            fx.admit(&earlier, None).expect("earlier").rotation_anchors,
+            vec![ROTATING_INDEX]
+        );
+        assert_eq!(fx.store.get_rotation_checkpoint(ROTATING_INDEX).expect("query"), Some(earlier));
+        assert_eq!(fx.store.all_rotation_checkpoints().expect("query").len(), 2);
+
+        // A third, later still: it qualifies, and is superseded rather than stored.
+        let latest = fx.signed_by(0, "2026-01-01T00:11:00.000000000Z");
+        assert_eq!(fx.admit(&latest, None).expect("latest").rotation_anchors, vec![ROTATING_INDEX]);
+        assert_eq!(fx.store.all_rotation_checkpoints().expect("query").len(), 2);
+    }
+
     #[test]
     fn a_checkpoint_over_the_genesis_manifest_alone_is_authenticated_and_series_usable() {
         let log_key = ahl_core::TestKey::from_seed_hex("log", &"78".repeat(32)).expect("seed");
@@ -1109,7 +1690,7 @@ mod tests {
         let cp =
             checkpoint_for(&log_key, &fx.config.log_id, 1, root, "2026-01-01T00:00:00.000000000Z");
 
-        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[]).expect("admits");
+        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[], None).expect("admits");
         let view = series_view(&fx.store, &fx.config).expect("view");
         assert_eq!(view.members.len(), 1);
         assert_eq!(view.members[0].state, CheckpointState::SeriesUsable);
@@ -1157,7 +1738,7 @@ mod tests {
         let root = compute_root(&leaves);
         let cp = checkpoint_for(&log_key, &log_id, 1, root, "2026-01-01T00:00:00.000000000Z");
         assert!(matches!(
-            ingest_checkpoint(&store, &config, &cp, None, &[]),
+            ingest_checkpoint(&store, &config, &cp, None, &[], None),
             Err(MirrorError::GovernanceChainUnresolvable { .. })
         ));
     }
@@ -1202,7 +1783,7 @@ mod tests {
         // never took effect.
         let cp =
             checkpoint_for(&log_key, &fx.config.log_id, 2, root, "2026-01-01T00:01:00.000000000Z");
-        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[])
+        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[], None)
             .expect("admits: governance never rotated");
     }
 
@@ -1267,7 +1848,7 @@ mod tests {
             root,
             "2026-01-01T00:00:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &pending)
+        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &pending, None)
             .expect("bootstraps its own governing rotation");
         assert_eq!(fx.store.next_index().expect("query"), 2);
     }
@@ -1292,7 +1873,7 @@ mod tests {
         .expect("valid config");
         let cp = checkpoint_for(&log_key, &log_id, 0, [0u8; 32], "2026-01-01T00:00:00.000000000Z");
         assert!(matches!(
-            ingest_checkpoint(&store, &config, &cp, None, &[]),
+            ingest_checkpoint(&store, &config, &cp, None, &[], None),
             Err(MirrorError::GovernanceChainUnresolvable { .. })
         ));
     }
@@ -1313,7 +1894,7 @@ mod tests {
             genuine_root_1,
             "2026-01-01T00:00:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &cp_a, None, &[])
+        ingest_checkpoint(&fx.store, &fx.config, &cp_a, None, &[], None)
             .expect("first checkpoint admits");
 
         // A second, later checkpoint at a larger tree_size, but with a root that is not a
@@ -1330,7 +1911,7 @@ mod tests {
             bogus_root,
             "2026-01-01T00:01:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &cp_b, None, &[])
+        ingest_checkpoint(&fx.store, &fx.config, &cp_b, None, &[], None)
             .expect("second checkpoint admits");
 
         // Now the real second entry arrives, promoted against cp_a's genuine extension —
@@ -1364,7 +1945,7 @@ mod tests {
             root_1,
             "2026-01-01T00:05:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &cp_a, None, &[]).expect("admits");
+        ingest_checkpoint(&fx.store, &fx.config, &cp_a, None, &[], None).expect("admits");
 
         let second = stored_entry(serde_json::json!({ "n": 1 }), &fx.producer);
         let root_2 = compute_root(&[genesis_leaf, log_leaf_hash(&second)]);
@@ -1377,7 +1958,7 @@ mod tests {
             root_2,
             "2026-01-01T00:04:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &cp_b, None, &[]).expect("admits");
+        ingest_checkpoint(&fx.store, &fx.config, &cp_b, None, &[], None).expect("admits");
 
         let view = series_view(&fx.store, &fx.config).expect("view");
         assert_eq!(view.gap_free_frontier, Some(1));
@@ -1402,7 +1983,7 @@ mod tests {
             root_1,
             "2026-01-01T00:01:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &cp_a, None, &[]).expect("admits");
+        ingest_checkpoint(&fx.store, &fx.config, &cp_a, None, &[], None).expect("admits");
 
         // A relaxed-cadence manifest version (1 hour) anchored next, rotating nothing else.
         let relaxed = stored_entry(
@@ -1442,7 +2023,7 @@ mod tests {
             root_2,
             "2026-01-01T00:41:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &cp_b, None, &[]).expect("admits");
+        ingest_checkpoint(&fx.store, &fx.config, &cp_b, None, &[], None).expect("admits");
 
         let view = series_view(&fx.store, &fx.config).expect("view");
         assert_eq!(view.gap_free_frontier, Some(1));
@@ -1467,7 +2048,7 @@ mod tests {
         let cp =
             checkpoint_for(&log_key, &fx.config.log_id, 1, root, "2026-01-01T01:00:00.000000000Z");
 
-        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[])
+        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[], None)
             .expect("authentication does not require a valid series start");
         let view = series_view(&fx.store, &fx.config).expect("view");
         assert_eq!(view.members[0].state, CheckpointState::SeriesUsable);
@@ -1491,7 +2072,7 @@ mod tests {
         stage_and_promote_at(&fx.store, 2, root, &[second], 1);
         let cp =
             checkpoint_for(&log_key, &fx.config.log_id, 2, root, "2026-01-01T00:01:00.000000000Z");
-        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[])
+        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[], None)
             .expect("admits: the genesis checkpoint itself was never published");
 
         let view = series_view(&fx.store, &fx.config).expect("view");
@@ -1523,9 +2104,9 @@ mod tests {
             [0x02u8; 32],
             "2026-01-01T00:02:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &cp_a, None, &[])
+        ingest_checkpoint(&fx.store, &fx.config, &cp_a, None, &[], None)
             .expect("admits: entries not yet complete for tree_size 2");
-        ingest_checkpoint(&fx.store, &fx.config, &cp_b, None, &[])
+        ingest_checkpoint(&fx.store, &fx.config, &cp_b, None, &[], None)
             .expect("admits: same reason, and a different checkpoint_time avoids the series-member conflict check");
 
         let view = series_view(&fx.store, &fx.config).expect("view");
@@ -1595,7 +2176,7 @@ mod tests {
         let entries_before = fx.store.get_entries_range(0, next_index_before).expect("query");
         let checkpoints_before = fx.store.all_checkpoints().expect("query");
 
-        let result = ingest_checkpoint(&fx.store, &fx.config, &cp, None, &pending);
+        let result = ingest_checkpoint(&fx.store, &fx.config, &cp, None, &pending, None);
         assert!(result.is_err(), "e3's proof, built for e2's leaf, must not open the root");
 
         assert_eq!(fx.store.next_index().expect("query"), next_index_before);
@@ -1625,7 +2206,7 @@ mod tests {
             root_1,
             "2026-01-01T00:00:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &cp_1, None, &[]).expect("admits");
+        ingest_checkpoint(&fx.store, &fx.config, &cp_1, None, &[], None).expect("admits");
 
         // Two authenticated checkpoints at tree_size 2 disagree on root_hash — equivocation,
         // not a tie. Detected regardless of whether this mirror holds entries for tree_size 2
@@ -1644,8 +2225,8 @@ mod tests {
             [0x02u8; 32],
             "2026-01-01T00:02:00.000000000Z",
         );
-        ingest_checkpoint(&fx.store, &fx.config, &branch_a, None, &[]).expect("admits");
-        ingest_checkpoint(&fx.store, &fx.config, &branch_b, None, &[]).expect("admits");
+        ingest_checkpoint(&fx.store, &fx.config, &branch_a, None, &[], None).expect("admits");
+        ingest_checkpoint(&fx.store, &fx.config, &branch_b, None, &[], None).expect("admits");
 
         let view = series_view(&fx.store, &fx.config).expect("view");
         assert_eq!(view.root_divergences, vec![2]);

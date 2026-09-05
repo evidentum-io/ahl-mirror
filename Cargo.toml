@@ -1,6 +1,6 @@
 [package]
 name = "ahl-mirror"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -67,6 +67,12 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+# For `tests/rotation_proof_end_to_end.rs` only, and only as a dev-dependency: I-D §7.1's
+# `rotation_proofs[]` element is assembled from BOTH components — this crate serves the
+# checkpoint and its inclusion path, the witness serves the cosignature — so the one test that
+# proves the two halves compose has to run both. Nothing in the shipped crate depends on it, and
+# the independence core spec §3.3 requires of a witness is a runtime property, not a build one.
+ahl-witness = { version = "0.4.0", path = "../ahl-witness" }
 http-body-util = "0.1.5"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }

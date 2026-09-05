@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/range", post(range_handler))
         .route("/v1/checkpoints", post(checkpoint_ingest_handler).get(list_checkpoints_handler))
         .route("/v1/checkpoints/{tree_size}", get(get_checkpoint_handler))
+        .route("/v1/rotation-proofs/{manifest_entry_index}", get(rotation_proof_handler))
         .route("/v1/itub/{index}", get(itub_handler))
         .route("/v1/consistency", get(consistency_handler))
         .with_state(state)
@@ -67,13 +68,15 @@ impl From<MirrorError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
-            MirrorError::UnknownCheckpoint { .. } | MirrorError::NotStaged { .. } => {
-                StatusCode::NOT_FOUND
-            }
+            MirrorError::UnknownCheckpoint { .. }
+            | MirrorError::UnknownRotationProof { .. }
+            | MirrorError::NotStaged { .. } => StatusCode::NOT_FOUND,
             MirrorError::IncompleteEntries { .. }
             | MirrorError::CheckpointNotSeriesUsable { .. }
             | MirrorError::SeriesEquivocated { .. } => StatusCode::CONFLICT,
             MirrorError::StoredEntryCorrupt { .. }
+            | MirrorError::TreeMaterialMissing { .. }
+            | MirrorError::TreeMaterialCorrupt { .. }
             | MirrorError::CheckpointRootMismatch { .. }
             | MirrorError::IndexOverflow { .. }
             | MirrorError::Atl(_)
@@ -301,8 +304,7 @@ async fn range_handler(
     .await?;
 
     let response = blocking(move || {
-        let all_entries = store.get_entries_range(0, checkpoint.tree_size)?;
-        crate::range::build_range_response(&checkpoint, req.from_index, req.to_index, &all_entries)
+        crate::range::build_range_response(&store, &checkpoint, req.from_index, req.to_index)
     })
     .await?;
 
@@ -324,12 +326,44 @@ struct CheckpointIngestRequest {
     /// key (core spec §7.3).
     #[serde(default)]
     entries_to_promote: Vec<PendingPromotion>,
+    /// The rotating manifest's entry index this checkpoint is offered as ROTATION-ANCHORING
+    /// material for (I-D §7.1), where the submitter names one.
+    ///
+    /// Optional, and naming it changes nothing about what is accepted: the server detects every
+    /// rotation a checkpoint qualifies for either way. What it changes is the REPORT — a named
+    /// rotation the checkpoint does not in fact anchor is refused with the reason, instead of
+    /// being silently admitted as an ordinary series member and quietly anchoring nothing.
+    #[serde(default)]
+    rotation_for: Option<u64>,
+}
+
+/// What `POST /v1/checkpoints` admitted a submission as.
+///
+/// Reported rather than left implicit, and reported as two independent facts rather than one
+/// choice: a rotation-anchoring checkpoint is deliberately absent from every series route (see
+/// [`crate::store`]), and a checkpoint can be BOTH a series member and a rotation anchor — which
+/// is what a rotation replacing only the witness key objects produces (I-D §7.1; see
+/// [`crate::checkpoint::Admission`]). A submitter told only "created" could tell none of those
+/// cases apart except by where the checkpoint later showed up.
+#[derive(Debug, Serialize)]
+struct AdmissionResponse {
+    /// Whether it entered the canonical checkpoint series.
+    series_member: bool,
+    /// The rotating-manifest entry indexes it anchors, served from
+    /// `GET /v1/rotation-proofs/{manifest_entry_index}` and from nowhere else.
+    rotation_anchors: Vec<u64>,
+}
+
+impl From<crate::checkpoint::Admission> for AdmissionResponse {
+    fn from(value: crate::checkpoint::Admission) -> Self {
+        Self { series_member: value.series_member, rotation_anchors: value.rotation_anchors }
+    }
 }
 
 async fn checkpoint_ingest_handler(
     State(state): State<AppState>,
     Json(req): Json<CheckpointIngestRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<(StatusCode, Json<AdmissionResponse>), ApiError> {
     let raw_bytes = req
         .raw
         .as_deref()
@@ -338,17 +372,18 @@ async fn checkpoint_ingest_handler(
 
     let store = Arc::clone(&state.store);
     let config = Arc::clone(&state.config);
-    blocking(move || {
+    let admission = blocking(move || {
         crate::checkpoint::ingest_checkpoint(
             &store,
             &config,
             &req.checkpoint,
             raw_bytes.as_deref(),
             &req.entries_to_promote,
+            req.rotation_for,
         )
     })
     .await?;
-    Ok(StatusCode::CREATED)
+    Ok((StatusCode::CREATED, Json(AdmissionResponse::from(admission))))
 }
 
 async fn list_checkpoints_handler(
@@ -386,6 +421,103 @@ async fn get_checkpoint_handler(
     })
     .await?;
     Ok(Json(reported))
+}
+
+// ---------------------------------------------------------------------------
+// Rotation-anchoring proofs (I-D §7.1)
+// ---------------------------------------------------------------------------
+
+/// One `governance.rotation_proofs[]` element, in the shape I-D §7.1 defines for it.
+///
+/// The member names and their meanings are the I-D's, not this crate's, so a receipt producer
+/// copies this object into `governance.rotation_proofs[]` unchanged rather than translating it.
+#[derive(Debug, Serialize)]
+struct RotationProofElement {
+    /// The entry index of the ROTATING manifest, which a receipt MUST match against that
+    /// manifest's own `governance.chain[]` element.
+    manifest_entry_index: u64,
+    /// The rotation-anchoring checkpoint: `tree_size` greater than `manifest_entry_index`, and
+    /// verifying under a log key of the OUTGOING set.
+    checkpoint: Checkpoint,
+    /// The path proving the rotating manifest's envelope entry id, AT `manifest_entry_index`,
+    /// to THIS checkpoint's `root_hash` — not to `anchoring.checkpoint.root_hash`.
+    inclusion_path: Vec<String>,
+    /// Cosignatures over this checkpoint under the OUTGOING witness set, REQUIRED at L3.
+    ///
+    /// Always empty here, and empty for a reason rather than as a gap: a mirror does not
+    /// cosign and holds no cosignature, so the only honest value it can serve is the empty
+    /// array. A deployment claiming L3 fills this member from its witness, which serves the
+    /// same element shape at its own rotation-cosignature route (`ahl-witness`), before the
+    /// element goes into a receipt.
+    witnesses: Vec<Value>,
+}
+
+async fn rotation_proof_handler(
+    State(state): State<AppState>,
+    Path(manifest_entry_index): Path<u64>,
+) -> Result<Json<RotationProofElement>, ApiError> {
+    let store = Arc::clone(&state.store);
+    let config = Arc::clone(&state.config);
+    let element =
+        blocking(move || rotation_proof_element(&store, &config, manifest_entry_index)).await?;
+    Ok(Json(element))
+}
+
+/// Assemble the `governance.rotation_proofs[]` element for the rotation anchored at
+/// `manifest_entry_index` from this mirror's own material (I-D §7.1).
+fn rotation_proof_element(
+    store: &Store,
+    config: &Config,
+    manifest_entry_index: u64,
+) -> Result<RotationProofElement, MirrorError> {
+    let element = {
+        let checkpoint = store
+            .get_rotation_checkpoint(manifest_entry_index)?
+            .ok_or(MirrorError::UnknownRotationProof { manifest_entry_index })?;
+
+        // Core spec §7.3: at or beyond the lowest divergent `tree_size` the log's checkpoints
+        // no longer describe one tree, and the rotation table is inside that scan (see
+        // `checkpoint::series_view`). Serving a path opened against one of two conflicting
+        // roots would be choosing a branch.
+        let view = crate::checkpoint::series_view(store, config)?;
+        if let Some(floor) = view.equivocation_floor {
+            if checkpoint.tree_size >= floor {
+                return Err(MirrorError::SeriesEquivocated {
+                    tree_size: checkpoint.tree_size,
+                    floor,
+                });
+            }
+        }
+
+        let have = store.count_entries(0, checkpoint.tree_size)?;
+        if have != checkpoint.tree_size {
+            return Err(MirrorError::IncompleteEntries { have, need: checkpoint.tree_size });
+        }
+        let proof = store.inclusion_proof(manifest_entry_index, checkpoint.tree_size)?;
+
+        // Self-check before serving, as the enumeration path does: the path this mirror hands
+        // out is one it has itself opened against the checkpoint's own root.
+        let root = ahl_core::parse_hash_hex(&checkpoint.root_hash)?;
+        let leaf = store
+            .leaf_hashes_range(manifest_entry_index, manifest_entry_index.saturating_add(1))?
+            .first()
+            .copied()
+            .ok_or(MirrorError::TreeMaterialMissing {
+                level: 0,
+                node_index: manifest_entry_index,
+            })?;
+        if !atl_core::core::merkle::verify_inclusion(&leaf, &proof, &root)? {
+            return Err(MirrorError::CheckpointRootMismatch { tree_size: checkpoint.tree_size });
+        }
+
+        Ok(RotationProofElement {
+            manifest_entry_index,
+            checkpoint,
+            inclusion_path: ahl_core::proof_path_hex(&proof),
+            witnesses: Vec::new(),
+        })
+    };
+    element
 }
 
 async fn itub_handler(
@@ -537,15 +669,8 @@ pub mod seam {
         let Ok(checkpoint) = series_usable_checkpoint(store, config, req.tree_size) else {
             return true;
         };
-        let Ok(all_entries) = store.get_entries_range(0, checkpoint.tree_size) else {
-            return true;
-        };
-        let _ = crate::range::build_range_response(
-            &checkpoint,
-            req.from_index,
-            req.to_index,
-            &all_entries,
-        );
+        let _ =
+            crate::range::build_range_response(store, &checkpoint, req.from_index, req.to_index);
         true
     }
 
@@ -565,7 +690,19 @@ pub mod seam {
             &req.checkpoint,
             raw.as_deref(),
             &req.entries_to_promote,
+            req.rotation_for,
         );
+        true
+    }
+
+    /// `GET /v1/rotation-proofs/{manifest_entry_index}`: the numeric path parameter, as
+    /// `axum` renders it before the handler sees it.
+    ///
+    /// The whole handler runs — the lookup, the equivocation floor, the completeness check,
+    /// the inclusion-path opening and the self-check — because the parameter is a client-chosen
+    /// `u64` that reaches the store's tree geometry directly.
+    pub fn rotation_proof(store: &Store, config: &Config, manifest_entry_index: u64) -> bool {
+        let _ = super::rotation_proof_element(store, config, manifest_entry_index);
         true
     }
 
@@ -1331,6 +1468,436 @@ mod tests {
             assert!(!seam::range(store, config, b"[]"));
             assert!(!seam::checkpoint_ingest(store, config, b"null"));
             assert!(!seam::consistency(store, config, "from=&to="));
+        }
+    }
+    // -----------------------------------------------------------------------
+    // Rotation-anchoring proofs (I-D §7.1)
+    // -----------------------------------------------------------------------
+
+    /// A log that has performed a log-key rotation, served through the real router.
+    ///
+    /// Three entries: the genesis manifest at index 0 under the OUTGOING log key, a successor
+    /// manifest at index 1 that replaces the log key set with the INCOMING one, and a subject
+    /// statement at index 2. Every payload is a complete I-D §6.2/§2.2 statement rather than
+    /// the minimum this crate itself reads, because
+    /// `a_receipt_carrying_the_served_element_verifies` hands the whole corpus to
+    /// `ahl_core::receipt::verify_receipt_report`, which reads all of it.
+    mod rotation {
+        use std::collections::BTreeMap;
+
+        use ahl_core::receipt::{
+            verify_receipt_report, AdaptorCapabilities, AdaptorProfile, Limits, Outcome,
+            TrustPolicy,
+        };
+
+        use super::*;
+
+        /// The artifact a verifier holds under `ahl-adaptor-atl-v1` in these tests. Its bytes
+        /// are what the manifests' `log.adaptor.hash` pins, recomputed rather than transcribed.
+        const PROFILE_DOCUMENT: &[u8] = b"ahl-adaptor-atl-v1 test artifact";
+
+        /// The entry index the rotating manifest is anchored at.
+        const ROTATING_INDEX: u64 = 1;
+
+        fn manifest_payload(
+            log_id: &str,
+            producer: &ahl_core::TestKey,
+            log_key: &ahl_core::TestKey,
+            predecessor: Option<&str>,
+        ) -> Value {
+            let mut payload = json!({
+                "ahl_version": ahl_core::AHL_VERSION,
+                "type": "manifest",
+                "producer": "producer-1",
+                "issued_at": "2026-01-01T00:00:00Z",
+                "valid_time": "2026-01-01T00:00:00Z",
+                "keys": [ { "key_id": producer.key_id(), "pubkey": producer.pubkey() } ],
+                "log": {
+                    "log_id": log_id,
+                    "operator": "log-operator-1",
+                    "adaptor": {
+                        "id": ahl_core::ATL_PROFILE_ID,
+                        "hash": ahl_core::sha256_hex(PROFILE_DOCUMENT),
+                    },
+                    "checkpoint_cadence": "PT1H",
+                    "cadence_epoch": "2026-01-01T00:00:00Z",
+                    "witness_grace_period": "PT15M",
+                    "keys": [ {
+                        "key_id": log_key.key_id(),
+                        "pubkey": log_key.pubkey(),
+                        "valid_from_index": 0,
+                    } ],
+                },
+                "datasets": {
+                    "records": {
+                        "canonicalization": "jcs",
+                        "commitment_mode": "plain",
+                        "key_access": "not-applicable",
+                        "authority": {
+                            "producer": "producer-1",
+                            "key_ids": [ producer.key_id() ],
+                        },
+                    },
+                },
+                "pipelines": { "include": [], "exclude": [] },
+                "windows": { "anchoring": "PT24H", "propagation": "P30D" },
+                "retention": { "statements": "P10Y" },
+                "properties": { "reproducible_reconstruction": false },
+                "level": "L2",
+            });
+            if let Some(predecessor) = predecessor {
+                payload["predecessor"] = json!(predecessor);
+            }
+            payload
+        }
+
+        struct Corpus {
+            state: AppState,
+            outgoing: ahl_core::TestKey,
+            incoming: ahl_core::TestKey,
+            producer: ahl_core::TestKey,
+            log_id: String,
+            genesis_entry_id: String,
+            envelopes: Vec<Value>,
+            leaves: Vec<Hash>,
+            root: Hash,
+        }
+
+        impl Corpus {
+            fn app(&self) -> Router {
+                router(self.state.clone())
+            }
+
+            /// A checkpoint over the whole three-entry tree, signed by `key`.
+            fn checkpoint(&self, key: &ahl_core::TestKey, time: &str) -> Checkpoint {
+                self.checkpoint_at(key, 3, self.root, time)
+            }
+
+            /// A checkpoint claiming `tree_size` and `root`, signed by `key`.
+            fn checkpoint_at(
+                &self,
+                key: &ahl_core::TestKey,
+                tree_size: u64,
+                root: Hash,
+                time: &str,
+            ) -> Checkpoint {
+                let mut cp = Checkpoint {
+                    log_id: self.log_id.clone(),
+                    tree_size,
+                    root_hash: format!("sha256:{}", hex::encode(root)),
+                    checkpoint_time: time.to_owned(),
+                    key_id: key.key_id(),
+                    signature: String::new(),
+                };
+                let blob = crate::checkpoint::checkpoint_blob(&cp).expect("well-formed");
+                cp.signature = key.sign(&blob);
+                cp
+            }
+        }
+
+        fn corpus() -> Corpus {
+            let producer =
+                ahl_core::TestKey::from_seed_hex("producer", &"a1".repeat(32)).expect("seed");
+            let outgoing =
+                ahl_core::TestKey::from_seed_hex("log-out", &"a2".repeat(32)).expect("seed");
+            let incoming =
+                ahl_core::TestKey::from_seed_hex("log-in", &"a3".repeat(32)).expect("seed");
+            let log_id = format!("sha256:{}", "a4".repeat(32));
+
+            let genesis = ahl_core::envelope(
+                manifest_payload(&log_id, &producer, &outgoing, None),
+                &producer,
+            );
+            let genesis_entry_id = ahl_core::entry_id(&genesis);
+            let rotating = ahl_core::envelope(
+                manifest_payload(&log_id, &producer, &incoming, Some(&genesis_entry_id)),
+                &producer,
+            );
+            let rotating_statement_id =
+                ahl_core::statement_id(&rotating).expect("well-formed envelope");
+            let subject = ahl_core::envelope(
+                json!({
+                    "ahl_version": ahl_core::AHL_VERSION,
+                    "type": "ingestion",
+                    "producer": "producer-1",
+                    "issued_at": "2026-01-01T00:00:00Z",
+                    "valid_time": "2026-01-01T00:00:00Z",
+                    "manifest": rotating_statement_id,
+                    "dataset": "records",
+                    "origin": "batch:2026-01-01/records-01",
+                    "record": format!("sha256:{}", "b1".repeat(32)),
+                }),
+                &producer,
+            );
+
+            let envelopes = vec![genesis, rotating, subject];
+            let entries: Vec<Vec<u8>> = envelopes.iter().map(ahl_core::jcs).collect();
+            let leaves: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+            let root = atl_core::core::merkle::compute_root(&leaves);
+
+            let store = Store::open_in_memory().expect("in-memory store");
+            for (index, bytes) in entries.iter().enumerate() {
+                let id = entry_id_of(bytes);
+                store.stage_entry(&id, bytes).expect("stage");
+                store
+                    .promote_entry(u64::try_from(index).expect("small test index"), &id)
+                    .expect("promote");
+            }
+            let config = Config::resolve(&ConfigSpec {
+                log_id: log_id.clone(),
+                genesis_manifest_entry_id: genesis_entry_id.clone(),
+                genesis_producer_keys: vec![KeyObjectSpec {
+                    key_id: producer.key_id(),
+                    pubkey: producer.pubkey(),
+                    valid_from_index: 0,
+                }],
+                store_path: ":memory:".to_owned(),
+            })
+            .expect("valid config");
+
+            Corpus {
+                state: AppState { store: Arc::new(store), config: Arc::new(config) },
+                outgoing,
+                incoming,
+                producer,
+                log_id,
+                genesis_entry_id,
+                envelopes,
+                leaves,
+                root,
+            }
+        }
+
+        async fn post_checkpoint(app: &Router, cp: &Checkpoint) -> (StatusCode, Value) {
+            let request = Request::post("/v1/checkpoints")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "checkpoint": cp })).expect("serialize"),
+                ))
+                .expect("valid request");
+            let response = app.clone().oneshot(request).await.expect("service call");
+            let status = response.status();
+            let body = response.into_body().collect().await.expect("body").to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        }
+
+        async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+            let request = Request::get(uri).body(Body::empty()).expect("valid request");
+            let response = app.clone().oneshot(request).await.expect("service call");
+            let status = response.status();
+            let body = response.into_body().collect().await.expect("body").to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        }
+
+        /// A genuine inclusion path for `leaves[index]` under the whole tree.
+        fn path_for(corpus: &Corpus, index: u64) -> Vec<String> {
+            inclusion_path_for(&corpus.leaves, index)
+        }
+
+        #[tokio::test]
+        async fn the_rotation_route_serves_the_element_and_the_series_routes_do_not() {
+            let corpus = corpus();
+            let app = corpus.app();
+            let rotation_cp = corpus.checkpoint(&corpus.outgoing, "2026-01-01T01:00:00.000000000Z");
+
+            let (status, body) = post_checkpoint(&app, &rotation_cp).await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(body["series_member"], false);
+            assert_eq!(body["rotation_anchors"], json!([ROTATING_INDEX]));
+
+            // Served on the rotation route, in the `rotation_proofs[]` element shape.
+            let (status, element) =
+                get_json(&app, &format!("/v1/rotation-proofs/{ROTATING_INDEX}")).await;
+            assert_eq!(status, StatusCode::OK, "{element}");
+            assert_eq!(element["manifest_entry_index"], ROTATING_INDEX);
+            assert_eq!(element["checkpoint"], serde_json::to_value(&rotation_cp).expect("json"));
+            assert_eq!(element["inclusion_path"], json!(path_for(&corpus, ROTATING_INDEX)));
+            assert_eq!(element["witnesses"], json!([]));
+
+            // And nowhere else: not in the series listing, not at its own tree_size, not as
+            // an ITUB bound, not as a consistency endpoint.
+            let (status, members) = get_json(&app, "/v1/checkpoints").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(members, json!([]), "rotation material is not a series member");
+            assert_eq!(get_json(&app, "/v1/checkpoints/3").await.0, StatusCode::NOT_FOUND);
+            assert_eq!(get_json(&app, "/v1/itub/0").await.0, StatusCode::NOT_FOUND);
+            assert_eq!(
+                get_json(&app, "/v1/consistency?from=1&to=3").await.0,
+                StatusCode::NOT_FOUND
+            );
+
+            // A rotation this log did not perform has no proof to serve.
+            assert_eq!(get_json(&app, "/v1/rotation-proofs/0").await.0, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn an_incoming_key_checkpoint_is_an_ordinary_series_member() {
+            let corpus = corpus();
+            let app = corpus.app();
+            let series_cp = corpus.checkpoint(&corpus.incoming, "2026-01-01T01:00:00.000000000Z");
+
+            let (status, body) = post_checkpoint(&app, &series_cp).await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(body["series_member"], true);
+            assert_eq!(body["rotation_anchors"], json!([]));
+
+            let (status, members) = get_json(&app, "/v1/checkpoints").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(members.as_array().map(Vec::len), Some(1));
+            assert_eq!(members[0]["state"], "series_usable");
+            assert_eq!(
+                get_json(&app, &format!("/v1/rotation-proofs/{ROTATING_INDEX}")).await.0,
+                StatusCode::NOT_FOUND
+            );
+        }
+
+        /// Held apart is not held outside the rules. A rotation-anchoring checkpoint that
+        /// contradicts a series member at the same `tree_size` is equivocation (core spec
+        /// §7.3), and from the lowest divergent size onward nothing may be grounded — the
+        /// rotation route included.
+        #[tokio::test]
+        async fn a_rotation_checkpoint_diverging_from_a_series_member_is_reported() {
+            let corpus = corpus();
+            let app = corpus.app();
+            // A size this store does not reach, so neither root is recomputable and both
+            // checkpoints are admitted as merely authenticated.
+            let series = corpus.checkpoint_at(
+                &corpus.incoming,
+                5,
+                [0x11; 32],
+                "2026-01-01T03:00:00.000000000Z",
+            );
+            let rotation = corpus.checkpoint_at(
+                &corpus.outgoing,
+                5,
+                [0x22; 32],
+                "2026-01-01T04:00:00.000000000Z",
+            );
+            assert_eq!(post_checkpoint(&app, &series).await.1["series_member"], true);
+            assert_eq!(
+                post_checkpoint(&app, &rotation).await.1["rotation_anchors"],
+                json!([ROTATING_INDEX])
+            );
+
+            let (status, body) =
+                get_json(&app, &format!("/v1/rotation-proofs/{ROTATING_INDEX}")).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert!(
+                body["error"].as_str().is_some_and(|e| e.contains("equivocates")),
+                "the divergence is named, not swallowed: {body}"
+            );
+            // And the series itself reports the same floor.
+            assert_eq!(get_json(&app, "/v1/checkpoints/5").await.0, StatusCode::CONFLICT);
+        }
+
+        /// The cross-check that decides whether the element this mirror serves is the thing
+        /// I-D §7.1 defines: a receipt carrying it, verified by `ahl-core`'s own verifier.
+        ///
+        /// Nothing in the element is edited on the way in — the bytes the route returned are
+        /// the bytes `governance.rotation_proofs[0]` carries. If the mirror had chosen the
+        /// wrong checkpoint, opened the path against the wrong root, or named the wrong
+        /// rotating index, §7.5.1 4b(M)'s rotation-anchoring rule would reject the receipt.
+        #[tokio::test]
+        async fn a_receipt_carrying_the_served_element_verifies() {
+            let corpus = corpus();
+            let app = corpus.app();
+            let rotation_cp = corpus.checkpoint(&corpus.outgoing, "2026-01-01T01:00:00.000000000Z");
+            let anchoring_cp =
+                corpus.checkpoint(&corpus.incoming, "2026-01-01T02:00:00.000000000Z");
+            assert_eq!(post_checkpoint(&app, &rotation_cp).await.0, StatusCode::CREATED);
+            assert_eq!(post_checkpoint(&app, &anchoring_cp).await.0, StatusCode::CREATED);
+
+            let (status, element) =
+                get_json(&app, &format!("/v1/rotation-proofs/{ROTATING_INDEX}")).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let key_object = |key: &ahl_core::TestKey, entry_index: u64| {
+                json!({
+                    "key_id": key.key_id(),
+                    "pubkey": key.pubkey(),
+                    "source": "manifest-chain",
+                    "binding": { "entry_index": entry_index },
+                })
+            };
+            let receipt = json!({
+                "ahl_receipt_version": "2",
+                "spec_version": "0.4.0",
+                "claim": {
+                    "type": "statement-anchored",
+                    "assurance": {
+                        "governance": "declared",
+                        "competing_triggers": "not-checked",
+                        "witnessed": false,
+                        "continued_history": false,
+                        "content_binding": "none",
+                    },
+                },
+                "subject": {
+                    "statement_id": ahl_core::statement_id(&corpus.envelopes[2]).expect("id"),
+                    "entry_id": ahl_core::entry_id(&corpus.envelopes[2]),
+                    "entry_index": 2,
+                    "manifest": ahl_core::statement_id(&corpus.envelopes[1]).expect("id"),
+                },
+                "envelope": corpus.envelopes[2],
+                "keys": {
+                    // The INCOMING log key binds to the version active for the anchoring
+                    // checkpoint's tree_size; the OUTGOING one binds to the predecessor, which
+                    // is what §7.1's transition exception requires of rotation material.
+                    "log": [
+                        key_object(&corpus.incoming, ROTATING_INDEX),
+                        key_object(&corpus.outgoing, 0),
+                    ],
+                    "witness": [],
+                    "producer": [ key_object(&corpus.producer, ROTATING_INDEX) ],
+                },
+                "anchoring": {
+                    "adaptor": {
+                        "id": ahl_core::ATL_PROFILE_ID,
+                        "hash": ahl_core::sha256_hex(PROFILE_DOCUMENT),
+                    },
+                    "checkpoint": anchoring_cp,
+                    "inclusion_path": path_for(&corpus, 2),
+                    "witnesses": [],
+                },
+                "governance": {
+                    "genesis_entry_id": corpus.genesis_entry_id,
+                    "chain": [
+                        {
+                            "envelope": corpus.envelopes[0],
+                            "entry_index": 0,
+                            "inclusion_path": path_for(&corpus, 0),
+                        },
+                        {
+                            "envelope": corpus.envelopes[1],
+                            "entry_index": ROTATING_INDEX,
+                            "inclusion_path": path_for(&corpus, ROTATING_INDEX),
+                        },
+                    ],
+                    "rotation_proofs": [ element ],
+                    "currency": { "mode": "declared" },
+                },
+            });
+
+            let policy = TrustPolicy {
+                genesis_entry_id: corpus.genesis_entry_id.clone(),
+                genesis_key_ids: None,
+                adaptor_profiles: BTreeMap::from([(
+                    ahl_core::ATL_PROFILE_ID.to_owned(),
+                    AdaptorProfile {
+                        document: PROFILE_DOCUMENT.to_vec(),
+                        capabilities: AdaptorCapabilities {
+                            checkpoint_raw: false,
+                            consistency_proofs: false,
+                        },
+                    },
+                )]),
+                dataset_keys: BTreeMap::new(),
+                trusted_witness_keys: BTreeMap::new(),
+                limits: Limits::default(),
+            };
+
+            let report = verify_receipt_report(&receipt, &policy).expect("the run completes");
+            assert_eq!(report.result, Outcome::Verified, "findings: {:?}", report.findings);
         }
     }
 }

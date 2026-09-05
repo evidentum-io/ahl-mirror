@@ -1,10 +1,10 @@
 //! Arbitrary bytes as the body of `POST /v1/range`.
 //!
 //! `{tree_size, from_index, to_index}`, all three client-chosen `u64` values, drive the
-//! series-usable checkpoint lookup and then `range::build_range_response`, which slices the
-//! held leaf hashes and entry bytes to `[from_index, to_index)` and generates and re-verifies
-//! an `AHLRP1` proof over that span. The range bounds are the crate's clearest untrusted
-//! arithmetic and its clearest untrusted slice.
+//! series-usable checkpoint lookup and then `range::build_range_response`, which opens the
+//! stored subtree material outside `[from_index, to_index)`, reads the window's leaf hashes
+//! and entry bytes, and generates and re-verifies an `AHLRP1` proof over that span. The range
+//! bounds are the crate's clearest untrusted arithmetic and its clearest untrusted slice.
 
 #![no_main]
 

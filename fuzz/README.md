@@ -10,10 +10,10 @@ reach the crate by other routes.
 | --- | --- | --- |
 | `stage` | `POST /v1/entries/stage` body | entry-id recomputation, envelope shape, JCS round-trip, adaptor metadata comparison |
 | `promote` | `POST /v1/entries/promote` body | `sha256:<hex>` proof path decoding and RFC 6962 inclusion verification at a client-chosen index |
-| `checkpoint` | `POST /v1/checkpoints` body | checkpoint field parsing, the optional 98-byte raw blob, governance resolution, root recomputation, signature check, batch promotion |
+| `checkpoint` | `POST /v1/checkpoints` body | checkpoint field parsing, the optional 98-byte raw blob, governance resolution, root recomputation, signature check, batch promotion, and the rotation search behind the optional `rotation_for` (I-D §7.1) |
 | `range` | `POST /v1/range` body | series-usable checkpoint lookup, then range slicing and `AHLRP1` generation and re-verification over client-chosen bounds |
 | `range_response` | a range response document | the offline verifier a client runs against a foreign mirror: proof decoding, per-entry leaf recomputation, root check |
-| `query` | path segment and query string | `axum`'s `Query` over the module's own query types, retrieval by id, the consistency endpoint's two bounds, `ITUB` |
+| `query` | path segment and query string | `axum`'s `Query` over the module's own query types, retrieval by id, the consistency endpoint's two bounds, `ITUB`, and the rotation-proof route's `manifest_entry_index` — which reaches the store's tree geometry, so the whole element build runs |
 | `governance` | one anchored statement | the manifest chain walk, as genesis and as a successor: producer keys, the `log` block, cadence, epoch, `predecessor` |
 | `config` | the deployment configuration | key decoding and `key_id` recomputation at startup |
 | `text` | one duration or checkpoint time | the ISO 8601 duration grammar and the §6.3 time rendering, where this crate's untrusted arithmetic lives |

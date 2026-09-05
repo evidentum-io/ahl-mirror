@@ -20,9 +20,10 @@ dependencies = [
 
 [[package]]
 name = "ahl-mirror"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ahl-core",
+ "ahl-witness",
  "atl-core",
  "axum",
  "base64",
@@ -35,6 +36,29 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ahl-witness"
+version = "0.4.0"
+dependencies = [
+ "ahl-core",
+ "atl-core",
+ "axum",
+ "base64",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "time",
  "tokio",

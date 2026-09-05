@@ -93,7 +93,11 @@ A library (`src/lib.rs` and siblings) plus a thin binary (`src/bin/ahl-mirror.rs
 dev-dependency: I-D §7.1's `rotation_proofs[]` element is assembled from both components — this
 crate serves the checkpoint and its inclusion path, the witness serves the cosignature — so the
 test that proves the two halves compose has to run both, and hands the joined element to
-`ahl_core::receipt::verify_receipt_report` unedited. Nothing in the shipped crate depends on the
+`ahl_core::receipt::verify_receipt_report` unedited. It does so twice, once per half of §7.1's
+definition: a LOG-key rotation, where the anchor is a thing apart from the series and several
+anchors are held to show the two components pick the same one, and a WITNESS-set rotation, where
+one checkpoint is both the series member the receipt is anchored under and the rotation proof's
+own checkpoint. Nothing in the shipped crate depends on the
 witness, and the independence core spec §3.3 requires of one is a runtime property, not a build
 one.
 
@@ -218,8 +222,11 @@ not needed.
   the version active for a rotation proof's checkpoint "is the rotating manifest OR A LATER
   ONE": a checkpoint several rotations past the one it anchors is matched against that
   rotation's own predecessor. A submission MAY name the rotation it is offered for
-  (`rotation_for`), which changes nothing about what is accepted and everything about the
-  report — a named rotation the checkpoint does not anchor is refused with the reason.
+  (`rotation_for`). It narrows nothing: every rotation the checkpoint qualifies for is
+  discovered and recorded either way — one checkpoint under an unchanged log key can anchor
+  several witness-set rotations at once, which is why `rotation_anchors` is a list — because
+  what a checkpoint anchors is a fact about the log, not about what the submitter knew. What
+  naming changes is the report: a name absent from the discovered set is refused with the reason.
 
   A checkpoint can earn BOTH answers, and the case is not exotic: §7.1 makes a change to the
   witness key objects a rotation on its own, and such a rotation leaves the log key set alone,

@@ -8,8 +8,12 @@
 //! which is exactly why this file runs both servers over one corpus and hands the composed
 //! element to `ahl_core`'s verifier without editing a byte of it.
 //!
-//! The corpus is L3 and rotates the LOG key at entry index 1, so the rotation proof is required
-//! (§7.5.1 4b(M)) and its cosignature requirement is live.
+//! Both corpora are L3 and rotate at entry index 1, so the rotation proof is required
+//! (§7.5.1 4b(M)) and its cosignature requirement is live. They rotate DIFFERENT halves of the
+//! governance key state, because the two cases compose differently: a LOG-key rotation makes the
+//! rotation-anchoring checkpoint a thing apart from the series, while a WITNESS-set rotation
+//! leaves the log key set alone, so one checkpoint is both the series member the receipt is
+//! anchored under and the rotation proof's own checkpoint (I-D §7.1).
 
 // Test code favours `.expect()` messages that document the fixture and direct indexing over
 // shapes it fixes itself: an assertion that fires IS the failure report here. `lib.rs` grants
@@ -62,11 +66,21 @@ fn key(tag: &'static str, byte: u8) -> ahl_core::TestKey {
     ahl_core::TestKey::from_seed_hex(tag, &format!("{byte:02x}").repeat(32)).expect("32-byte seed")
 }
 
+/// Which half of the governance key state a corpus's version 1 replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rotates {
+    /// The log checkpoint-signing key objects; the witness objects are held still.
+    LogKey,
+    /// The witness key objects; the log key set is held still, so one checkpoint serves as both
+    /// a series member and the rotation's anchor.
+    WitnessSet,
+}
+
 fn manifest_payload(
     log_id: &str,
     producer: &ahl_core::TestKey,
     log_key: &ahl_core::TestKey,
-    witness: &ahl_core::TestKey,
+    witnesses: &[(&str, &ahl_core::TestKey)],
     predecessor: Option<&str>,
 ) -> Value {
     let mut payload = json!({
@@ -92,14 +106,17 @@ fn manifest_payload(
                 "valid_from_index": 0,
             } ],
         },
-        "witnesses": [ {
-            "witness_id": "witness-1",
-            "keys": [ {
-                "key_id": witness.key_id(),
-                "pubkey": witness.pubkey(),
-                "valid_from_index": 0,
-            } ],
-        } ],
+        "witnesses": witnesses
+            .iter()
+            .map(|(witness_id, key)| json!({
+                "witness_id": witness_id,
+                "keys": [ {
+                    "key_id": key.key_id(),
+                    "pubkey": key.pubkey(),
+                    "valid_from_index": 0,
+                } ],
+            }))
+            .collect::<Vec<_>>(),
         "datasets": {
             "records": {
                 "canonicalization": "jcs",
@@ -167,21 +184,98 @@ impl Deployment {
     }
 }
 
-fn deployment() -> Deployment {
+/// The two servers, over one corpus: the mirror holds the entries, the witness is handed them
+/// with every submission.
+fn servers(
+    log_id: &str,
+    genesis_entry_id: &str,
+    producer: &ahl_core::TestKey,
+    entries: &[Vec<u8>],
+) -> (Router, Router) {
+    let store = ahl_mirror::Store::open_in_memory().expect("in-memory store");
+    for (index, bytes) in entries.iter().enumerate() {
+        let id = ahl_core::sha256_hex(bytes);
+        store.stage_entry(&id, bytes).expect("stage");
+        store.promote_entry(u64::try_from(index).expect("small test index"), &id).expect("promote");
+    }
+    let config = Config::resolve(&ConfigSpec {
+        log_id: log_id.to_owned(),
+        genesis_manifest_entry_id: genesis_entry_id.to_owned(),
+        genesis_producer_keys: vec![KeyObjectSpec {
+            key_id: producer.key_id(),
+            pubkey: producer.pubkey(),
+            valid_from_index: 0,
+        }],
+        store_path: ":memory:".to_owned(),
+    })
+    .expect("valid config");
+    let mirror = ahl_mirror::http::router(ahl_mirror::http::AppState {
+        store: Arc::new(store),
+        config: Arc::new(config),
+    });
+
+    let anchor = LogAnchor::resolve(&LogAnchorSpec {
+        log_id: log_id.to_owned(),
+        genesis_manifest_entry_id: genesis_entry_id.to_owned(),
+        genesis_producer_keys: vec![WitnessKeySpec {
+            key_id: producer.key_id(),
+            pubkey: producer.pubkey(),
+            valid_from_index: 0,
+        }],
+    })
+    .expect("valid anchor");
+    let mut anchors = HashMap::new();
+    anchors.insert(log_id.to_owned(), anchor);
+    let signer = Ed25519WitnessSigner::from_seed("witness-1", &WITNESS_SEED).expect("32 bytes");
+    let witness = ahl_witness::http::router(ahl_witness::http::AppState {
+        store: Arc::new(ahl_witness::store::Store::open_in_memory().expect("in-memory store")),
+        signer: Arc::new(signer),
+        anchors: Arc::new(anchors),
+    });
+
+    (mirror, witness)
+}
+
+fn deployment(rotates: Rotates) -> Deployment {
     let producer = key("producer", 0xe1);
     let outgoing = key("log-out", 0xe2);
-    let incoming = key("log-in", 0xe3);
+    // The log key set moves only for a log-key rotation; for a witness-set rotation it is the
+    // same key object in both versions, which is exactly what makes one checkpoint serve twice.
+    let incoming = match rotates {
+        Rotates::LogKey => key("log-in", 0xe3),
+        Rotates::WitnessSet => key("log-out", 0xe2),
+    };
     let witness_key =
         ahl_core::TestKey::from_seed_hex("witness-1", &hex::encode(WITNESS_SEED)).expect("seed");
+    // A second declared identity carries the witness-set rotation, so `witness-1` — the one that
+    // actually cosigns — keeps its standing under BOTH versions (I-D §7.1: a rotation proof's
+    // cosignature must verify under a witness key of the OUTGOING state).
+    let second_before = key("witness-2", 0xe6);
+    let second_after = match rotates {
+        Rotates::LogKey => key("witness-2", 0xe6),
+        Rotates::WitnessSet => key("witness-2", 0xe7),
+    };
     let log_id = format!("sha256:{}", "e4".repeat(32));
 
     let genesis = ahl_core::envelope(
-        manifest_payload(&log_id, &producer, &outgoing, &witness_key, None),
+        manifest_payload(
+            &log_id,
+            &producer,
+            &outgoing,
+            &[("witness-1", &witness_key), ("witness-2", &second_before)],
+            None,
+        ),
         &producer,
     );
     let genesis_entry_id = ahl_core::entry_id(&genesis);
     let rotating = ahl_core::envelope(
-        manifest_payload(&log_id, &producer, &incoming, &witness_key, Some(&genesis_entry_id)),
+        manifest_payload(
+            &log_id,
+            &producer,
+            &incoming,
+            &[("witness-1", &witness_key), ("witness-2", &second_after)],
+            Some(&genesis_entry_id),
+        ),
         &producer,
     );
     let subject = ahl_core::envelope(
@@ -204,48 +298,12 @@ fn deployment() -> Deployment {
     let leaves: Vec<Hash> = entries.iter().map(|bytes| log_leaf_hash(bytes)).collect();
     let root = compute_root(&leaves);
 
-    // The mirror holds the entries; the witness is handed them with every submission.
-    let store = ahl_mirror::Store::open_in_memory().expect("in-memory store");
-    for (index, bytes) in entries.iter().enumerate() {
-        let id = ahl_core::sha256_hex(bytes);
-        store.stage_entry(&id, bytes).expect("stage");
-        store.promote_entry(u64::try_from(index).expect("small test index"), &id).expect("promote");
-    }
-    let config = Config::resolve(&ConfigSpec {
-        log_id: log_id.clone(),
-        genesis_manifest_entry_id: genesis_entry_id.clone(),
-        genesis_producer_keys: vec![KeyObjectSpec {
-            key_id: producer.key_id(),
-            pubkey: producer.pubkey(),
-            valid_from_index: 0,
-        }],
-        store_path: ":memory:".to_owned(),
-    })
-    .expect("valid config");
-    let mirror = ahl_mirror::http::router(ahl_mirror::http::AppState {
-        store: Arc::new(store),
-        config: Arc::new(config),
-    });
-
-    let anchor = LogAnchor::resolve(&LogAnchorSpec {
-        log_id: log_id.clone(),
-        genesis_manifest_entry_id: genesis_entry_id.clone(),
-        genesis_producer_keys: vec![WitnessKeySpec {
-            key_id: producer.key_id(),
-            pubkey: producer.pubkey(),
-            valid_from_index: 0,
-        }],
-    })
-    .expect("valid anchor");
-    let mut anchors = HashMap::new();
-    anchors.insert(log_id.clone(), anchor);
-    let signer = Ed25519WitnessSigner::from_seed("witness-1", &WITNESS_SEED).expect("32 bytes");
-    assert_eq!(signer.key_id(), witness_key.key_id(), "the manifests declare this key");
-    let witness = ahl_witness::http::router(ahl_witness::http::AppState {
-        store: Arc::new(ahl_witness::store::Store::open_in_memory().expect("in-memory store")),
-        signer: Arc::new(signer),
-        anchors: Arc::new(anchors),
-    });
+    let (mirror, witness) = servers(&log_id, &genesis_entry_id, &producer, &entries);
+    assert_eq!(
+        Ed25519WitnessSigner::from_seed("witness-1", &WITNESS_SEED).expect("32 bytes").key_id(),
+        witness_key.key_id(),
+        "the manifests declare the key the witness server signs with"
+    );
 
     Deployment {
         mirror,
@@ -417,7 +475,7 @@ fn receipt_over(
 /// the rotation, so the join is only sound if both sides pick the same one.
 #[tokio::test]
 async fn the_two_components_compose_one_verifying_rotation_proof() {
-    let deployment = deployment();
+    let deployment = deployment(Rotates::LogKey);
 
     // Two qualifying anchors, offered LATEST FIRST so that "the one both sides pick" cannot be
     // "the one that happened to arrive first".
@@ -499,6 +557,89 @@ async fn the_two_components_compose_one_verifying_rotation_proof() {
         limits: Limits::default(),
     };
 
+    let report = verify_receipt_report(&receipt, &policy).expect("the run completes");
+    assert_eq!(report.result, Outcome::Verified, "findings: {:?}", report.findings);
+}
+
+/// The other half of I-D §7.1's definition, composed the same way. A rotation that replaces only
+/// the WITNESS key objects leaves the log key set alone, so the checkpoint that anchors it is an
+/// ordinary member of the series — one object, judged under the general rule as
+/// `anchoring.checkpoint` and under the transition exception as the rotation proof's checkpoint,
+/// and cosigned once.
+///
+/// This is the case that produces no rotation material at all if the exception is only consulted
+/// after the ordinary rule has failed, so it is the case a receipt is most likely to be missing.
+#[tokio::test]
+async fn a_witness_only_rotation_composes_the_same_way() {
+    let deployment = deployment(Rotates::WitnessSet);
+
+    // One checkpoint, offered once to each component, earning both records.
+    let checkpoint = deployment.checkpoint(&deployment.outgoing, "2026-01-01T01:00:00.000000000Z");
+    let (status, body) =
+        post_json(&deployment.mirror, "/v1/checkpoints", &json!({ "checkpoint": &checkpoint }))
+            .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["series_member"], true, "the log key set did not move");
+    assert_eq!(body["rotation_anchors"], json!([ROTATING_INDEX]), "the witness objects did");
+
+    let (status, cosigned) = post_json(
+        &deployment.witness,
+        &format!("/v1/logs/{}/witness", deployment.log_id),
+        &json!({
+            "checkpoint": &checkpoint,
+            "entries": deployment
+                .entries
+                .iter()
+                .map(|bytes| Value::String(format!("base64:{}", B64.encode(bytes))))
+                .collect::<Vec<_>>(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{cosigned}");
+    assert_eq!(cosigned["series_member"], true);
+    assert_eq!(cosigned["rotation_anchors"], json!([ROTATING_INDEX]));
+
+    // It is served by BOTH the series routes and the rotation route, and it is one object.
+    let (status, series) = get_json(&deployment.mirror, "/v1/checkpoints/3").await;
+    assert_eq!(status, StatusCode::OK, "{series}");
+    let (status, mut element) =
+        get_json(&deployment.mirror, &format!("/v1/rotation-proofs/{ROTATING_INDEX}")).await;
+    assert_eq!(status, StatusCode::OK, "{element}");
+    assert_eq!(element["checkpoint"], serde_json::to_value(&checkpoint).expect("json"));
+    assert_eq!(element["witnesses"], json!([]));
+
+    let (status, served) = get_json(
+        &deployment.witness,
+        &format!("/v1/logs/{}/rotation-cosignatures/{ROTATING_INDEX}", deployment.log_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{served}");
+    assert_eq!(element["checkpoint"], served["checkpoint"]);
+    assert_eq!(
+        served["witnesses"][0]["cosignature"], cosigned["cosignature"],
+        "one cosignature, indexed twice — not a second one made for the rotation"
+    );
+
+    element["witnesses"] = served["witnesses"].clone();
+    let receipt = receipt_over(&deployment, &checkpoint, &cosigned, &element);
+
+    let policy = TrustPolicy {
+        genesis_entry_id: deployment.genesis_entry_id.clone(),
+        genesis_key_ids: None,
+        adaptor_profiles: BTreeMap::from([(
+            ahl_core::ATL_PROFILE_ID.to_owned(),
+            AdaptorProfile {
+                document: PROFILE_DOCUMENT.to_vec(),
+                capabilities: AdaptorCapabilities {
+                    checkpoint_raw: false,
+                    consistency_proofs: false,
+                },
+            },
+        )]),
+        dataset_keys: BTreeMap::new(),
+        trusted_witness_keys: BTreeMap::new(),
+        limits: Limits::default(),
+    };
     let report = verify_receipt_report(&receipt, &policy).expect("the run completes");
     assert_eq!(report.result, Outcome::Verified, "findings: {:?}", report.findings);
 }

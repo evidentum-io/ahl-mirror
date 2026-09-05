@@ -7,6 +7,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   AHL_CORE_REF: v0.4.0
+  # `ahl-witness` is a dev-dependency (`../ahl-witness`) of the rotation-proof composition test;
+  # its ref moves with the dev-dependency requirement in Cargo.toml.
+  AHL_WITNESS_REF: v0.4.0
 
 # `ahl-core` is a path dependency (`../ahl-core`), so every job checks out this crate and the
 # core side by side and runs cargo from the crate directory. The core is a private repository:
@@ -30,6 +33,12 @@ jobs:
           ref: ${{ env.AHL_CORE_REF }}
           ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
           path: ahl-core
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-witness
+          ref: ${{ env.AHL_WITNESS_REF }}
+          ssh-key: ${{ secrets.AHL_WITNESS_DEPLOY_KEY }}
+          path: ahl-witness
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -48,6 +57,12 @@ jobs:
           ref: ${{ env.AHL_CORE_REF }}
           ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
           path: ahl-core
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-witness
+          ref: ${{ env.AHL_WITNESS_REF }}
+          ssh-key: ${{ secrets.AHL_WITNESS_DEPLOY_KEY }}
+          path: ahl-witness
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -69,6 +84,12 @@ jobs:
           ref: ${{ env.AHL_CORE_REF }}
           ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
           path: ahl-core
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-witness
+          ref: ${{ env.AHL_WITNESS_REF }}
+          ssh-key: ${{ secrets.AHL_WITNESS_DEPLOY_KEY }}
+          path: ahl-witness
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -88,6 +109,12 @@ jobs:
           ref: ${{ env.AHL_CORE_REF }}
           ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
           path: ahl-core
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-witness
+          ref: ${{ env.AHL_WITNESS_REF }}
+          ssh-key: ${{ secrets.AHL_WITNESS_DEPLOY_KEY }}
+          path: ahl-witness
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -109,6 +136,12 @@ jobs:
           ref: ${{ env.AHL_CORE_REF }}
           ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
           path: ahl-core
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-witness
+          ref: ${{ env.AHL_WITNESS_REF }}
+          ssh-key: ${{ secrets.AHL_WITNESS_DEPLOY_KEY }}
+          path: ahl-witness
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -136,6 +169,12 @@ jobs:
           ref: ${{ env.AHL_CORE_REF }}
           ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
           path: ahl-core
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-witness
+          ref: ${{ env.AHL_WITNESS_REF }}
+          ssh-key: ${{ secrets.AHL_WITNESS_DEPLOY_KEY }}
+          path: ahl-witness
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -161,6 +200,12 @@ jobs:
           ref: ${{ env.AHL_CORE_REF }}
           ssh-key: ${{ secrets.AHL_CORE_DEPLOY_KEY }}
           path: ahl-core
+      - uses: actions/checkout@v4
+        with:
+          repository: evidentum-io/ahl-witness
+          ref: ${{ env.AHL_WITNESS_REF }}
+          ssh-key: ${{ secrets.AHL_WITNESS_DEPLOY_KEY }}
+          path: ahl-witness
       - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
         with:

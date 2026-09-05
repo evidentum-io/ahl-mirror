@@ -349,13 +349,28 @@ pub fn verify_series_consistency(
     Ok(verify_consistency(&proof, &from_root, &to_root)?)
 }
 
-/// Whether this mirror holds the whole contiguous prefix `[0, tree_size)`.
+/// Whether this mirror holds the whole contiguous prefix `[0, tree_size)`, with the derived
+/// tree material to open it.
 ///
-/// A `SELECT COUNT(*)` over an append-only, gap-free table (promotion refuses any index but
-/// the next one — see [`crate::store`]), so it answers "does the store reach `tree_size`"
-/// without reading a leaf hash, let alone an entry.
+/// Two questions, and they fail differently on purpose:
+///
+/// - Does canonical storage reach `tree_size`? A `SELECT COUNT(*)` over an append-only,
+///   gap-free table (promotion refuses any index but the next one — see [`crate::store`]),
+///   so it answers without reading a leaf hash, let alone an entry. `Ok(false)` if not: a
+///   short prefix is an ordinary state of a mirror that is behind, and core spec §7.3 admits
+///   a checkpoint as merely *authenticated* there.
+/// - Given that it does, is the complete-subtree cache present for that size? An absence is
+///   not a short prefix but a storage integrity fault — the rows are derived from entries
+///   this store already holds — so it is an ERROR
+///   ([`MirrorError::TreeMaterialMissing`], naming the node), never a quiet `false` and never
+///   a recomputation from leaf hashes at serving time. The remedy is the cache rebuild the
+///   store runs on open.
 fn holds_prefix(conn: &rusqlite::Connection, tree_size: u64) -> MirrorResult<bool> {
-    Ok(crate::store::count_entries_raw(conn, 0, tree_size)? == tree_size)
+    if crate::store::count_entries_raw(conn, 0, tree_size)? != tree_size {
+        return Ok(false);
+    }
+    crate::store::require_subtree_cache_raw(conn, tree_size)?;
+    Ok(true)
 }
 
 /// Whether `cp.root_hash` is the root of the prefix this mirror holds at `cp.tree_size`.
@@ -382,6 +397,23 @@ fn series_consistency_stored(
     let (proof, _) =
         crate::store::consistency_proof_measured_raw(conn, from_cp.tree_size, to_cp.tree_size)?;
     Ok(verify_consistency(&proof, &from_root, &to_root)?)
+}
+
+/// Whether `err` says the STORE is broken, rather than that this checkpoint cannot be
+/// established from a sound one.
+///
+/// The distinction decides who hears about it: a checkpoint this mirror cannot establish is
+/// reported as merely authenticated and the series carries on, while a storage integrity
+/// fault is propagated — [`series_view`] refuses to publish a verdict computed over material
+/// it has just found missing or unreadable.
+const fn is_storage_fault(err: &MirrorError) -> bool {
+    matches!(
+        err,
+        MirrorError::TreeMaterialMissing { .. }
+            | MirrorError::TreeMaterialCorrupt { .. }
+            | MirrorError::Store(_)
+            | MirrorError::StoreInit(_)
+    )
 }
 
 /// Whether `cp` is series-usable given `pred`, the nearest earlier series-usable member:
@@ -912,11 +944,17 @@ pub fn series_view(store: &Store, config: &Config) -> MirrorResult<SeriesView> {
     for cp in &all {
         // One acquisition of the store's lock per member, so the prefix check, the root and
         // the consistency proof all see one consistent state. A member this mirror cannot
-        // establish — short prefix, unreadable tree material, a malformed root string — is
-        // reported as merely authenticated, which is what it is: unproven here, not refused.
-        let usable = store
-            .with_conn(|conn| series_usable_stored(conn, cp, last_usable.as_ref()))
-            .unwrap_or(false);
+        // establish — short prefix, a malformed root string — is reported as merely
+        // authenticated, which is what it is: unproven here, not refused. A broken STORE is
+        // the other case entirely and is propagated (see [`is_storage_fault`]): a view
+        // computed over tree material this deployment has just found missing would be a
+        // verdict it cannot stand behind.
+        let usable =
+            match store.with_conn(|conn| series_usable_stored(conn, cp, last_usable.as_ref())) {
+                Ok(usable) => usable,
+                Err(err) if is_storage_fault(&err) => return Err(err),
+                Err(_) => false,
+            };
 
         members.push(ReportedCheckpoint {
             checkpoint: cp.clone(),
@@ -1215,6 +1253,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A cache row missing behind the store's back withholds series-usability and refuses
+    /// admission by name, rather than being answered by a recomputation from leaf hashes.
+    /// `ITUB` goes unavailable with it, which is the honest report: this mirror can no longer
+    /// open the root it would be grounding a bound on.
+    #[test]
+    fn a_missing_cache_node_refuses_admission_and_withholds_series_usability() {
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"9c".repeat(32)).expect("seed");
+        let fx = fixture(&log_key, "2026-01-01T00:00:00Z"); // genesis cadence: 5 minutes
+        let genesis_leaf = log_leaf_hash(&fx.store.get_entries_range(0, 1).expect("range")[0]);
+        let second = stored_entry(serde_json::json!({ "n": 1 }), &fx.producer);
+        let root = compute_root(&[genesis_leaf, log_leaf_hash(&second)]);
+        stage_and_promote_at(&fx.store, 2, root, &[second], 1);
+        let cp =
+            checkpoint_for(&log_key, &fx.config.log_id, 2, root, "2026-01-01T00:01:00.000000000Z");
+        ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[], None).expect("admits");
+
+        let view = series_view(&fx.store, &fx.config).expect("view");
+        assert_eq!(view.members[0].state, CheckpointState::SeriesUsable);
+        assert_eq!(itub(&view, 0).map(|cp| cp.tree_size), Some(2));
+
+        fx.store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM subtree_roots WHERE level = 1 AND node_index = 0", [])
+                    .map(|_| ())
+                    .map_err(MirrorError::from)
+            })
+            .expect("drop the cached node behind the store's back");
+
+        // The named error, where a caller can see it.
+        assert!(matches!(
+            fx.store.with_conn(|conn| holds_prefix(conn, 2)),
+            Err(MirrorError::TreeMaterialMissing { level: 1, node_index: 0 })
+        ));
+        assert!(matches!(
+            ingest_checkpoint(&fx.store, &fx.config, &cp, None, &[], None),
+            Err(MirrorError::TreeMaterialMissing { level: 1, node_index: 0 })
+        ));
+
+        // And the series view refuses outright rather than publishing a verdict over
+        // material it cannot open — so `ITUB` is unavailable, by name, not by omission.
+        assert!(matches!(
+            series_view(&fx.store, &fx.config),
+            Err(MirrorError::TreeMaterialMissing { level: 1, node_index: 0 })
+        ));
     }
 
     #[test]

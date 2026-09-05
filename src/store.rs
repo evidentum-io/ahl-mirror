@@ -50,8 +50,10 @@
 //! # Tree material beside the entries
 //!
 //! Two derived columns/tables exist so that an enumeration response costs `O(window + log n)`
-//! reads rather than `O(n)` (adaptor profile §10.3-§10.5). Neither is authority: both are
-//! recomputable from the entry bytes, and the migration below rebuilds either on demand.
+//! reads rather than `O(n)` (adaptor profile §10.3-§10.5), and so that a root or a
+//! consistency proof costs `O(log n)` reads and no entry bytes at all. Neither is authority:
+//! both are recomputable from the entry bytes, and the migration below rebuilds either on
+//! demand.
 //!
 //! - `entries.leaf_hash` holds each canonical entry's ATL log leaf hash (adaptor profile
 //!   §4.2), written at promotion. Existing rows are backfilled once, on open.
@@ -63,6 +65,15 @@
 //!   promotion of its last leaf. `compute_subtree_root` then opens any span of the tree
 //!   through these two, descending only the right spine.
 //!
+//! Every root and every proof this crate computes is opened through those two and nothing
+//! else — `subtree_root_raw` and `log_root_raw` for a root, `inclusion_proof_raw` for an RFC
+//! 6962 inclusion path, `consistency_proof_measured_raw` for an RFC 9162 consistency path
+//! (the `&Connection` cores below, surfaced as [`Store::subtree_root`], [`Store::log_root`],
+//! [`Store::inclusion_proof`] and [`Store::consistency_proof`]). No caller re-derives a leaf
+//! hash from entry bytes to answer a question about the tree: entry bytes are read to be
+//! **served** (retrieval, an enumeration window) and to be **parsed** (the governance chain's
+//! `manifest`/`key` statements), never to rebuild a root.
+//!
 //! Concurrency: the store serializes all access behind one connection and one mutex.
 //! Governance resolution and signature verification (read-only) happen before any write; the
 //! writes themselves — promoting every entry in a checkpoint's `entries_to_promote` batch and
@@ -73,12 +84,13 @@
 //! construction (one producer, one log, per adaptor profile §3), so cross-request
 //! transactions are not needed on top of this.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::Mutex;
 
 use atl_core::core::merkle::{
-    compute_subtree_root, generate_inclusion_proof, hash_children, Hash, InclusionProof,
+    compute_root, compute_subtree_root, generate_consistency_proof, generate_inclusion_proof,
+    hash_children, ConsistencyProof, Hash, InclusionProof,
 };
 use rusqlite::{params, Connection, OptionalExtension as _};
 
@@ -445,6 +457,53 @@ impl Store {
         self.with_conn(|conn| subtree_root_raw(conn, offset, size))
     }
 
+    /// The RFC 6962 root of the whole stored prefix `[0, tree_size)`, opened through the
+    /// stored complete-subtree roots — `O(log tree_size)` node reads, no entry bytes. A
+    /// `tree_size` of zero is the empty tree, whose root is `SHA-256("")`.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::Atl`] if the prefix is not inside the stored material,
+    /// [`MirrorError::TreeMaterialMissing`]/[`MirrorError::TreeMaterialCorrupt`] for an
+    /// unusable stored node, or [`MirrorError::Store`].
+    pub fn log_root(&self, tree_size: u64) -> MirrorResult<Hash> {
+        self.with_conn(|conn| log_root_raw(conn, tree_size))
+    }
+
+    /// An RFC 9162 consistency proof between tree sizes `from_size` and `to_size`, opened
+    /// through the stored tree material in `O(log to_size)` node reads and no entry bytes.
+    ///
+    /// The store MUST hold the full `[0, to_size)` prefix — a proof over leaves this mirror
+    /// does not have would be a claim about a tree it cannot see.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorError::IncompleteEntries`] if the store does not hold the whole `[0, to_size)`
+    /// prefix, [`MirrorError::Atl`] if `from_size > to_size`,
+    /// [`MirrorError::TreeMaterialMissing`]/[`MirrorError::TreeMaterialCorrupt`] for an
+    /// unusable stored node, or [`MirrorError::Store`].
+    pub fn consistency_proof(
+        &self,
+        from_size: u64,
+        to_size: u64,
+    ) -> MirrorResult<ConsistencyProof> {
+        self.consistency_proof_measured(from_size, to_size).map(|(proof, _)| proof)
+    }
+
+    /// [`Store::consistency_proof`], additionally reporting what it read (see
+    /// [`TreeReadCost`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::consistency_proof`].
+    pub fn consistency_proof_measured(
+        &self,
+        from_size: u64,
+        to_size: u64,
+    ) -> MirrorResult<(ConsistencyProof, TreeReadCost)> {
+        self.with_conn(|conn| consistency_proof_measured_raw(conn, from_size, to_size))
+    }
+
     // -----------------------------------------------------------------------------------
     // Checkpoints
     // -----------------------------------------------------------------------------------
@@ -805,22 +864,47 @@ pub(crate) fn leaf_hashes_range_raw(
     Ok(hashes)
 }
 
-/// An RFC 6962 inclusion proof of the leaf at `leaf_index` under a tree of `tree_size`,
-/// opened through the stored tree material (adaptor profile §8.2).
+/// What opening one proof or root cost to read out of the store.
 ///
-/// Costs `O(log tree_size)` stored nodes for the same reason [`subtree_root_raw`] does: every
-/// sibling on the path is either a complete power-of-two subtree the cache holds or a short
-/// fold over ones it does. A read failure inside the callback is captured and re-raised rather
-/// than being reported as a missing node.
-pub(crate) fn inclusion_proof_raw(
+/// Reported rather than asserted, for the same reason [`crate::range::RangeReadCost`] is: the
+/// point of the stored tree material is that a proof about a log does not read the log, and a
+/// number a caller can print is the only form of that claim which cannot quietly stop being
+/// true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TreeReadCost {
+    /// Stored 32-octet log-tree nodes read: leaf hashes and complete-subtree roots alike.
+    pub tree_nodes: u64,
+}
+
+impl TreeReadCost {
+    /// Octets read from the store: 32 per node.
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.tree_nodes.saturating_mul(32)
+    }
+}
+
+/// Run `f` over a reader of the stored tree material, counting the nodes it reads.
+///
+/// `atl_core`'s proof and root builders take a `(level, index) -> Option<Hash>` callback and
+/// treat `None` as "not stored, descend instead", which leaves no channel for a storage
+/// failure. So a failure is captured here and re-raised after the call, rather than being
+/// silently reported to the builder as an absent node and answered by a descent that reads
+/// bytes it should not have had to.
+fn with_tree_nodes<T>(
     conn: &Connection,
-    leaf_index: u64,
-    tree_size: u64,
-) -> MirrorResult<InclusionProof> {
+    f: impl FnOnce(&dyn Fn(u32, u64) -> Option<Hash>) -> Result<T, atl_core::AtlError>,
+) -> MirrorResult<(T, TreeReadCost)> {
     let failure: RefCell<Option<MirrorError>> = RefCell::new(None);
+    let reads = Cell::new(0_u64);
     let get_node = |level: u32, index: u64| -> Option<Hash> {
         match tree_node_raw(conn, level, index) {
-            Ok(node) => node,
+            Ok(node) => {
+                if node.is_some() {
+                    reads.set(reads.get().saturating_add(1));
+                }
+                node
+            }
             Err(err) => {
                 let mut slot = failure.borrow_mut();
                 if slot.is_none() {
@@ -830,11 +914,26 @@ pub(crate) fn inclusion_proof_raw(
             }
         }
     };
-    let proof = generate_inclusion_proof(leaf_index, tree_size, get_node);
+    let computed = f(&get_node);
     if let Some(err) = failure.borrow_mut().take() {
         return Err(err);
     }
-    Ok(proof?)
+    Ok((computed?, TreeReadCost { tree_nodes: reads.get() }))
+}
+
+/// An RFC 6962 inclusion proof of the leaf at `leaf_index` under a tree of `tree_size`,
+/// opened through the stored tree material (adaptor profile §8.2).
+///
+/// Costs `O(log tree_size)` stored nodes for the same reason [`subtree_root_raw`] does: every
+/// sibling on the path is either a complete power-of-two subtree the cache holds or a short
+/// fold over ones it does.
+pub(crate) fn inclusion_proof_raw(
+    conn: &Connection,
+    leaf_index: u64,
+    tree_size: u64,
+) -> MirrorResult<InclusionProof> {
+    with_tree_nodes(conn, |get_node| generate_inclusion_proof(leaf_index, tree_size, get_node))
+        .map(|(proof, _)| proof)
 }
 
 /// The RFC 6962 root of the subtree spanning leaves `[offset, offset + size)`, opened through
@@ -842,28 +941,73 @@ pub(crate) fn inclusion_proof_raw(
 ///
 /// `atl_core`'s own recursion does the walking: it takes a complete power-of-two aligned
 /// subtree straight from `subtree_roots` where one is stored, and descends only where it is
-/// not — which, for a store whose cache is current, is the right spine alone. A read failure
-/// inside the callback cannot be returned through it, so it is captured and re-raised here
-/// rather than being reported as a missing node.
+/// not — which, for a store whose cache is current, is the right spine alone.
 pub(crate) fn subtree_root_raw(conn: &Connection, offset: u64, size: u64) -> MirrorResult<Hash> {
-    let failure: RefCell<Option<MirrorError>> = RefCell::new(None);
-    let get_node = |level: u32, index: u64| -> Option<Hash> {
-        match tree_node_raw(conn, level, index) {
-            Ok(node) => node,
-            Err(err) => {
-                let mut slot = failure.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(err);
-                }
-                None
-            }
-        }
-    };
-    let computed = compute_subtree_root(offset, size, &get_node);
-    if let Some(err) = failure.borrow_mut().take() {
-        return Err(err);
+    with_tree_nodes(conn, |get_node| compute_subtree_root(offset, size, &get_node))
+        .map(|(root, _)| root)
+}
+
+/// The RFC 6962 root of the whole stored prefix `[0, tree_size)`, opened through the stored
+/// tree material — `O(log tree_size)` node reads, no entry bytes.
+///
+/// A `tree_size` of zero is the empty tree, whose root is `SHA-256("")` and reads nothing.
+/// This is what every root check in this crate compares a checkpoint's `root_hash` against
+/// (see [`crate::checkpoint`]); nothing re-derives a root by hashing entry envelopes.
+pub(crate) fn log_root_raw(conn: &Connection, tree_size: u64) -> MirrorResult<Hash> {
+    if tree_size == 0 {
+        return Ok(compute_root(&[]));
     }
-    Ok(computed?)
+    subtree_root_raw(conn, 0, tree_size)
+}
+
+/// An RFC 9162 consistency proof between tree sizes `from_size` and `to_size`, opened through
+/// the stored tree material, with what it read.
+///
+/// The proof is the RFC 9162 SUBPROOF path: `O(log to_size)` subtree roots, each of which the
+/// cache answers with one read where it is a complete power-of-two subtree and a fold over
+/// the right spine where it is not. So the whole proof costs `O(log to_size)` node reads and
+/// no entry bytes at all.
+///
+/// The store MUST hold the full `[0, to_size)` prefix — a proof over leaves this mirror does
+/// not have would be a claim about a tree it cannot see.
+pub(crate) fn consistency_proof_measured_raw(
+    conn: &Connection,
+    from_size: u64,
+    to_size: u64,
+) -> MirrorResult<(ConsistencyProof, TreeReadCost)> {
+    let have = count_entries_raw(conn, 0, to_size)?;
+    if have != to_size {
+        return Err(MirrorError::IncompleteEntries { have, need: to_size });
+    }
+    with_tree_nodes(conn, |get_node| generate_consistency_proof(from_size, to_size, get_node))
+}
+
+/// The entry-bytes prover this module replaced, kept as a TEST ORACLE.
+///
+/// It re-derives every leaf hash of `[0, to_size)` from the entry envelopes and hands the
+/// sequence to `atl_core::core::merkle::generate_consistency_proof` through a level-0-only
+/// node reader — which is exactly what `http::consistency_handler` and
+/// `checkpoint::series_view` did before the cached prover above existed.
+/// `tests::the_cached_prover_agrees_with_an_entry_bytes_build` holds the two together for
+/// every `(m, n)` pair over every tree shape up to 33 entries, so a divergence in node
+/// choice or node order is a test failure rather than something a reader has to take on
+/// trust.
+#[cfg(test)]
+fn consistency_proof_from_entry_bytes(
+    all_entries: &[Vec<u8>],
+    from_size: u64,
+    to_size: u64,
+) -> MirrorResult<ConsistencyProof> {
+    let to = usize::try_from(to_size).expect("small test size");
+    let leaf_hashes: Vec<Hash> =
+        all_entries[..to].iter().map(|bytes| log_leaf_hash(bytes)).collect();
+    Ok(generate_consistency_proof(from_size, to_size, |level, index| {
+        if level == 0 {
+            leaf_hashes.get(usize::try_from(index).ok()?).copied()
+        } else {
+            None
+        }
+    })?)
 }
 
 // -----------------------------------------------------------------------------------
@@ -1187,6 +1331,87 @@ mod tests {
                 assert_eq!(opened, expected, "span [{offset}, {})", offset + size);
             }
         }
+    }
+
+    /// The cached prover and the entry-bytes oracle MUST agree: the same root for every
+    /// prefix, and the same RFC 9162 consistency path — node for node, in the same order —
+    /// for every `(m, n)` pair. Tree sizes 1..=33 cover every ragged right spine a log can
+    /// have at small scale (powers of two, one either side of them, and the odd sizes
+    /// between), and `m` runs over `0..=n`, so the trivial pairs (`m == 0`, `m == n`) are
+    /// covered alongside the rest.
+    #[test]
+    fn the_cached_prover_agrees_with_an_entry_bytes_build() {
+        for size in 1..=33_u64 {
+            let (store, entries) = store_with(size);
+            let leaves: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+            for n in 1..=size {
+                let end = usize::try_from(n).expect("small test size");
+                assert_eq!(
+                    store.log_root(n).expect("the store holds this prefix"),
+                    compute_root(&leaves[..end]),
+                    "tree_size {size}, root over [0, {n})"
+                );
+                for m in 0..=n {
+                    assert_eq!(
+                        store.consistency_proof(m, n).expect("the store holds this prefix"),
+                        consistency_proof_from_entry_bytes(&entries, m, n).expect("oracle"),
+                        "tree_size {size}, consistency ({m}, {n})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_empty_tree_root_is_the_hash_of_no_bytes_and_reads_nothing() {
+        let (store, _) = store_with(0);
+        assert_eq!(store.log_root(0).expect("the empty tree"), compute_root(&[]));
+    }
+
+    #[test]
+    fn a_consistency_proof_over_a_prefix_the_store_does_not_hold_is_refused() {
+        let (store, _) = store_with(4);
+        assert!(matches!(
+            store.consistency_proof(2, 9),
+            Err(MirrorError::IncompleteEntries { have: 4, need: 9 })
+        ));
+    }
+
+    /// The measurement this cached prover exists for: a consistency proof between sizes
+    /// 5 000 and 10 000 over a ten-thousand-entry log reads a handful of stored 32-octet
+    /// nodes and not one entry envelope.
+    ///
+    /// The entry-bytes build is what the same proof cost before, and is measured here in the
+    /// same run rather than quoted, so the comparison is of two numbers this test produced.
+    #[test]
+    fn a_consistency_proof_over_a_ten_thousand_entry_log_reads_no_entry_bytes() {
+        const LOG: u64 = 10_000;
+        let (store, entries) = store_with(LOG);
+
+        let (proof, cost) =
+            store.consistency_proof_measured(5_000, LOG).expect("the store holds the prefix");
+        assert_eq!(
+            proof,
+            consistency_proof_from_entry_bytes(&entries, 5_000, LOG).expect("oracle"),
+            "the cached proof is the entry-bytes proof"
+        );
+
+        // What the entry-bytes build read for the same proof: every envelope in [0, 10 000).
+        let before: u64 = entries.iter().map(|b| b.len() as u64).sum();
+        assert!(
+            cost.total_bytes().saturating_mul(500) < before,
+            "cached prover read {} bytes; the entry-bytes build read {before}",
+            cost.total_bytes()
+        );
+
+        // Recorded so the report quotes numbers this test produced rather than an estimate.
+        println!(
+            "consistency read cost, sizes 5000 -> {LOG} over a {LOG}-entry log: \
+             before {before} bytes (entry bytes for the whole prefix), \
+             after {} bytes ({} stored tree nodes x 32)",
+            cost.total_bytes(),
+            cost.tree_nodes
+        );
     }
 
     #[test]

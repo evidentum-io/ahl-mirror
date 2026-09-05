@@ -1382,12 +1382,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// The served `consistency_path` is byte for byte the path an entry-bytes build produces
-    /// — the route now opens the proof through the store's cached tree material, and the
-    /// response is unchanged by that.
-    #[tokio::test]
-    async fn the_served_consistency_path_is_the_entry_bytes_path() {
-        let hx = harness(); // cadence: 5 minutes
+    /// An app whose store holds the genesis manifest plus nine entries, with series-usable
+    /// checkpoints at tree sizes 5 and 10 — three minutes apart, inside the harness's
+    /// five-minute cadence. Returns the app and the nine entries, in index order.
+    async fn app_with_two_series_members(hx: &TestHarness) -> (Router, Vec<Vec<u8>>) {
         let app = router(hx.state.clone());
 
         let first: Vec<Vec<u8>> = (0u8..4).map(envelope_bytes).collect();
@@ -1395,7 +1393,7 @@ mod tests {
             assert_eq!(stage(&app, bytes).await, StatusCode::CREATED);
         }
         let (cp1, pending1) =
-            signed_checkpoint_for(&hx, &first, "2026-01-01T00:00:00.000000000Z", true);
+            signed_checkpoint_for(hx, &first, "2026-01-01T00:00:00.000000000Z", true);
         assert_eq!(submit_checkpoint(&app, &cp1, &pending1).await, StatusCode::CREATED);
 
         let more: Vec<Vec<u8>> = (4u8..9).map(envelope_bytes).collect();
@@ -1404,8 +1402,19 @@ mod tests {
         }
         let all_new: Vec<Vec<u8>> = first.iter().chain(more.iter()).cloned().collect();
         let (cp2, pending2) =
-            signed_checkpoint_for(&hx, &all_new, "2026-01-01T00:03:00.000000000Z", true);
+            signed_checkpoint_for(hx, &all_new, "2026-01-01T00:03:00.000000000Z", true);
         assert_eq!(submit_checkpoint(&app, &cp2, &pending2).await, StatusCode::CREATED);
+
+        (app, all_new)
+    }
+
+    /// The served `consistency_path` is byte for byte the path an entry-bytes build produces
+    /// — the route now opens the proof through the store's cached tree material, and the
+    /// response is unchanged by that.
+    #[tokio::test]
+    async fn the_served_consistency_path_is_the_entry_bytes_path() {
+        let hx = harness(); // cadence: 5 minutes
+        let (app, all_new) = app_with_two_series_members(&hx).await;
 
         // tree sizes 5 and 10: the genesis manifest, then four entries, then five more.
         let request = Request::get("/v1/consistency?from=5&to=10")
@@ -1435,6 +1444,47 @@ mod tests {
             .collect();
         assert!(!expected.is_empty(), "a 5 -> 10 proof is not the trivial empty path");
         assert_eq!(value["consistency_path"].as_array().expect("array"), &expected);
+    }
+
+    /// A cache row missing behind the store's back takes the consistency route out of
+    /// service — a storage integrity fault, reported as one — rather than being answered by
+    /// a proof rebuilt from entry-derived leaf hashes.
+    #[tokio::test]
+    async fn a_consistency_request_over_a_gapped_cache_is_refused_by_name() {
+        let hx = harness();
+        let (app, _) = app_with_two_series_members(&hx).await;
+        hx.state
+            .store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM subtree_roots WHERE level = 2 AND node_index = 0", [])
+                    .map(|_| ())
+                    .map_err(MirrorError::from)
+            })
+            .expect("drop one cached node behind the store's back");
+
+        let request = Request::get("/v1/consistency?from=5&to=10")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = app.clone().oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            value["error"],
+            "log tree material at level 2, node 0 is missing from the store"
+        );
+
+        // ITUB goes with it, and as the same fault: an unavailable ITUB (404) would claim
+        // this mirror had looked and found no bound, which is not what happened.
+        let request = Request::get("/v1/itub/0").body(Body::empty()).expect("valid request");
+        let response = app.oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            value["error"],
+            "log tree material at level 2, node 0 is missing from the store"
+        );
     }
 
     /// The fuzz seam runs the same parsers the handlers above run, so it is exercised the

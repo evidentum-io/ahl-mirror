@@ -503,6 +503,28 @@ mod tests {
         assert!(!verify_range_response(&response).expect("well-formed proof"));
     }
 
+    /// A cache row missing behind the store's back is refused by name, not answered by
+    /// recomputing that subtree from leaf hashes: the window promise is `O(window + log n)`
+    /// reads, and a silent fold over `[0, 8)` would break it on material the deployment can
+    /// no longer vouch for. Reopening the store rebuilds the cache and restores service.
+    #[test]
+    fn a_missing_cache_node_is_refused_rather_than_recomputed() {
+        let (store, entries) = store_over(9);
+        let checkpoint = checkpoint_over(&entries);
+        store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM subtree_roots WHERE level = 3", [])
+                    .map(|_| ())
+                    .map_err(MirrorError::from)
+            })
+            .expect("drop one cached node behind the store's back");
+
+        assert!(matches!(
+            build_range_response(&store, &checkpoint, 0, 3),
+            Err(MirrorError::TreeMaterialMissing { level: 3, node_index: 0 })
+        ));
+    }
+
     /// The windowed builder and the full-prefix oracle MUST produce the same bytes, for every
     /// window of every tree shape — the same proof nodes in the same order, the same entries,
     /// the same checkpoint. Tree sizes 1..=33 cover every ragged right spine a log can have at

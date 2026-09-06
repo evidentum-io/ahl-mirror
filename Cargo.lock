@@ -4,7 +4,9 @@ version = 4
 
 [[package]]
 name = "ahl-core"
-version = "0.4.0"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02bdd836265c8d235b85e9f1c682cc699482d19f18ffcaceeb2c0bc8ebdf479f"
 dependencies = [
  "atl-core",
  "base64",
@@ -46,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "ahl-witness"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ahl-core",
  "atl-core",
@@ -129,7 +131,8 @@ dependencies = [
 [[package]]
 name = "atl-core"
 version = "0.23.2"
-source = "git+https://github.com/evidentum-io/atl-core?rev=79ac9c085857#79ac9c08585720cbd0de79a31662d99f68efb2f0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0e0c4203a8a4990b12790335a871fc2717ad0ab5e11a33cb68155a5ff804957"
 dependencies = [
  "base64",
  "ed25519-dalek",

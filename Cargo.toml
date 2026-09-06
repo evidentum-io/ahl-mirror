@@ -44,12 +44,12 @@ todo = "deny"
 unimplemented = "deny"
 missing_panics_doc = "deny"
 # See ahl-core Cargo.toml for the rationale: thiserror 1.x (pulled in directly and via the
-# pinned atl-core revision) resolves against both syn 2.x and syn 3.x transitively.
+# registry `atl-core`) resolves against both syn 2.x and syn 3.x transitively.
 multiple_crate_versions = "allow"
 
 [dependencies]
-ahl-core = { version = "0.4.0", path = "../ahl-core" }
-atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", version = "0.23.2", default-features = false }
+ahl-core = "0.5.0"
+atl-core = { version = "0.23.2", default-features = false }
 axum = "0.8.9"
 base64 = "0.22"
 clap = { version = "4.6.6", features = ["derive"] }
@@ -72,7 +72,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # checkpoint and its inclusion path, the witness serves the cosignature — so the one test that
 # proves the two halves compose has to run both. Nothing in the shipped crate depends on it, and
 # the independence core spec §3.3 requires of a witness is a runtime property, not a build one.
-ahl-witness = { version = "0.4.0", path = "../ahl-witness" }
+ahl-witness = "0.4.1"
 http-body-util = "0.1.5"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }

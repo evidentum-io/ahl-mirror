@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "ahl-mirror"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ahl-core",
  "ahl-witness",

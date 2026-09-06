@@ -6,6 +6,7 @@ rust-version = "1.92"
 license = "Apache-2.0"
 description = "Independent AHL log mirror: byte-exact retrieval and authenticated range enumeration for the ahl-adaptor-atl-v1 profile"
 repository = "https://github.com/evidentum-io/ahl-mirror"
+homepage = "https://ahl-protocol.org"
 readme = "README.md"
 categories = ["cryptography", "data-structures"]
 keywords = ["provenance", "transparency-log", "merkle-tree", "ahl"]

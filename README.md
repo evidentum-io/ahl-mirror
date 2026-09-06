@@ -110,9 +110,9 @@ the rules themselves.
 Canonicalization (JCS/RFC 8785), family-string parsing, envelope and checkpoint identifiers,
 range-proof generation/verification, and envelope signature verification (`verify_envelope`,
 reused as-is for governance statements' producer signatures) are all reused from `ahl-core`
-(`ahl-core = { path = "../ahl-core" }`) rather than reimplemented — the same anti-drift
+(`ahl-core = "0.5.0"`, from crates.io) rather than reimplemented — the same anti-drift
 discipline `ahl-core` itself follows against `atl-core`. This crate calls `atl-core`'s Merkle
-primitives directly, at the same pinned revision `ahl-core` depends on, only where `ahl-core`
+primitives directly, at the same registry version `ahl-core` depends on, only where `ahl-core`
 does not expose them: RFC 9162 consistency proofs, RFC 6962 inclusion-proof generation, and
 the ATL-specific log-leaf construction of adaptor profile §4.2
 (`SHA-256(0x00 || payload_hash || metadata_hash)`), which is deliberately different from the

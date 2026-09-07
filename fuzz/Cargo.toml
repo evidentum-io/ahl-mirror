@@ -12,8 +12,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
-ahl-core = { path = "../../ahl-core" }
-atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", default-features = false }
+ahl-core = "0.5.0"
+atl-core = { version = "=0.23.2", default-features = false }
 
 [dependencies.ahl-mirror]
 path = ".."

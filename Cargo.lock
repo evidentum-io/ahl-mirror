@@ -49,6 +49,8 @@ dependencies = [
 [[package]]
 name = "ahl-witness"
 version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9739f3502a5c7f3f5449cb7451459011e083a03cbf06c0fe1bfb37a18d6061f7"
 dependencies = [
  "ahl-core",
  "atl-core",
